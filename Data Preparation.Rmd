@@ -39,6 +39,8 @@ wpp_raw <- readr::read_csv(raw_path, guess_max = 1e6)
 glimpse(wpp_raw)
 
 # ---- Filter to South Africa & keep only the years we need ----
+
+years_keep <- 2025:2035  
 # Prefer human-readable "South Africa"; fallback to LocID==710 if needed.
 wpp_za <- wpp_raw %>%
   filter(
@@ -97,77 +99,10 @@ readr::write_csv(wpp_pop, out_file)
 message("Saved: ", out_file)
 ```
 
-```{r}
-# ---- Binning definitions (Option B) ----
-# Single-year: 0..14
-single_years <- 0:14
-
-# Five-year bands: 15-19, 20-24, ..., 70-74, and open-ended 75+
-five_lower <- seq(15, 70, by = 5)
-five_upper <- five_lower + 4
-
-# Build bin table
-age_bins_tbl <- tibble::tibble(
-  bin_index = seq_along(c(single_years, five_lower, 75)),
-  lower     = c(single_years, five_lower, 75),
-  upper     = c(single_years, five_upper, Inf),
-  label     = c(
-    as.character(single_years),
-    paste0(five_lower, "-", five_upper),
-    "75+"
-  )
-) %>%
-  mutate(
-    # Mark bins that intersect ages 15..44 (for CRS later)
-    CRS_relevant = (lower <= 44 & upper >= 15)
-  )
-
-# ---- Helper: map single-year ages to bin_index ----
-map_age_to_bin <- function(age_vec, bins_tbl = age_bins_tbl) {
-  sapply(age_vec, function(a) {
-    idx <- which(bins_tbl$lower <= a & a <= bins_tbl$upper)[1]
-    if (length(idx) == 0) NA_integer_ else idx
-  })
-}
-
-# ---- Aggregate the processed single-year populations into bins ----
-# Input here is wpp_pop (year, age, sex, pop) from the previous chunk
-pop_binned <- wpp_pop %>%
-  mutate(bin_index = map_age_to_bin(age)) %>%
-  filter(!is.na(bin_index)) %>%
-  group_by(year, sex, bin_index) %>%
-  summarise(pop = sum(pop), .groups = "drop") %>%
-  left_join(age_bins_tbl, by = "bin_index") %>%
-  arrange(year, sex, bin_index)
-
-# Quick sanity: each (year, sex) should sum the same as the single-year totals
-check_totals <- pop_binned %>%
-  group_by(year, sex) %>%
-  summarise(pop_binned = sum(pop), .groups = "drop") %>%
-  left_join(
-    wpp_pop %>% group_by(year, sex) %>% summarise(pop_single = sum(pop), .groups = "drop"),
-    by = c("year", "sex")
-  ) %>%
-  mutate(diff = pop_binned - pop_single)
-
-print(check_totals %>% mutate(ok = abs(diff) < 1e-6)) # all match- good.
-
-stopifnot(all(abs(check_totals$diff) < 1e-6))
-
-# ---- Save binned file ----
-out_file_binned <- file.path(out_dir, "pop_binned.csv")
-readr::write_csv(pop_binned, out_file_binned)
-message("Saved: ", out_file_binned)
-
-# Peek
-head(pop_binned, 20)
-```
-
 # Annual live births
 
 ```{r}
 # Paths
-raw_path_fert <- "data/raw/WPP2024_Fertility_by_Age1.csv.gz"  # adjust extension if needed
 out_dir       <- "data/processed"
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
@@ -491,5 +426,93 @@ message("Saved: ", file.path(out_dir, "pregnancy_prevalence.csv"))
 # Peek
 head(preg_prev)
 summary(preg_prev$prev)
+```
+
+# Mortality rate
+
+```{r}
+# ---- Paths and choices ----
+lt_path    <- "data/raw/WPP2024_Life_Table_Abridged_Medium_2024-2100.csv.gz"
+proc_dir   <- "data/processed"
+dir.create(proc_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Choose which years of hazards to build (baseline only is fine; or a range)
+mort_years <- 2025:2035  # adjust as needed
+
+# ---- Header peek (you posted these already) ----
+# names(readr::read_csv(lt_path, n_max = 0, show_col_types = FALSE))
+
+# ---- Read only needed columns (fast) ----
+lt_small <- readr::read_csv(
+  lt_path,
+  col_select = c("Location","LocID","Variant","Time","Sex","AgeGrp","AgeGrpStart","AgeGrpSpan","mx","qx"),
+  show_col_types = FALSE
+)
+
+# ---- Filter to South Africa, chosen years, and the matching variant ----
+lt_za <- lt_small %>%
+  dplyr::filter(
+    (Location == "South Africa") | (LocID == 710),
+    Time %in% mort_years,
+    Variant == "Medium"  # your file is the Medium variant
+  ) %>%
+  dplyr::mutate(
+    sex = dplyr::case_when(Sex %in% c("Female","F") ~ "F",
+                           Sex %in% c("Male","M")   ~ "M",
+                           TRUE ~ NA_character_),
+    age_start = as.integer(AgeGrpStart),
+    span      = as.integer(AgeGrpSpan)
+  ) %>%
+  dplyr::select(Time, sex, age_start, span, qx, mx)
+
+# ---- Compute a continuous hazard per band ----
+# Prefer qx if present; fall back to mx (central death rate) if qx is missing.
+# For open-ended 100+ (span is NA), set span = 1 and cap age_start at 100.
+lt_haz <- lt_za %>%
+  dplyr::mutate(
+    span = dplyr::if_else(is.na(span), 1L, span),
+    age_start = pmin(age_start, 100L),
+    # Guardrails for qx
+    qx = dplyr::if_else(is.na(qx), NA_real_, pmin(pmax(qx, 0), 0.999999)),
+    # Compute mu per band
+    mu_band = dplyr::case_when(
+      !is.na(qx) ~ -log(1 - qx) / pmax(span, 1L),
+      is.na(qx) & !is.na(mx) ~ as.numeric(mx),     # mx is close to a continuous hazard
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  dplyr::filter(!is.na(mu_band))
+
+# ---- Expand bands to single-year ages ----
+# For each row (band), create 'span' rows: ages = age_start, age_start+1, ..., age_start+span-1
+# Cap ages at 100 so the top open-ended group maps to age 100 only.
+lt_expanded <- lt_haz %>%
+  dplyr::mutate(n_years = pmin(span, 101L - age_start)) %>%
+  dplyr::filter(n_years > 0) %>%
+  tidyr::uncount(weights = n_years, .id = "rep_id") %>%
+  dplyr::mutate(
+    age = pmin(age_start + rep_id - 1L, 100L)
+  ) %>%
+  dplyr::select(
+    year = Time, sex, age, mu = mu_band
+  ) %>%
+  dplyr::arrange(year, sex, age)
+
+# ---- Keep exactly ages 0..100 per year/sex (deduplicate if overlaps) ----
+# If there are overlaps (shouldn't be, but just in case), take the first occurrence.
+lt_singleyear <- lt_expanded %>%
+  dplyr::group_by(year, sex, age) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+# ---- Guardrails ----
+stopifnot(all(lt_singleyear$age >= 0 & lt_singleyear$age <= 100))
+stopifnot(all(is.finite(lt_singleyear$mu)))
+# Expect 2 sexes * 101 ages * length(mort_years) rows
+# print(dplyr::count(lt_singleyear, year, sex, name = "n_ages"))
+
+# ---- Save for the model (single-year hazards per year/sex/age) ----
+readr::write_csv(lt_singleyear, file.path(proc_dir, "mortality_singleyear.csv"))
+message("Saved: ", file.path(proc_dir, "mortality_singleyear.csv"))
 ```
 
