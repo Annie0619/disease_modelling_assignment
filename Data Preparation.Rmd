@@ -1,0 +1,495 @@
+---
+title: "Data Preparation"
+author: "Andomei Smit: SMTAND051"
+date: "16/10/2025"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+    keep_tex: true
+---
+
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.pos = 'H')
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(stringr)
+rm(list=ls())
+```
+
+# Population
+
+```{r}
+# ---- paths & options ----
+raw_path  <- "data/raw/WPP2024_PopulationBySingleAgeSex_Constant fertility_2024-2100.csv.gz"
+out_dir   <- "data/processed"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+```{r}
+# ---- Read (readr can read .csv.gz directly) ----
+wpp_raw <- readr::read_csv(raw_path, guess_max = 1e6)
+
+# Quick peek
+glimpse(wpp_raw)
+
+# ---- Filter to South Africa & keep only the years we need ----
+# Prefer human-readable "South Africa"; fallback to LocID==710 if needed.
+wpp_za <- wpp_raw %>%
+  filter(
+    (Location == "South Africa" | LocID == 710),
+    Time %in% years_keep
+  )
+
+# ---- Normalize ages (handle "100+") ----
+# We’ll use AgeGrpStart as the numeric age; if AgeGrp contains "+", force age=100
+wpp_za <- wpp_za %>%
+  mutate(
+    age = if_else(str_detect(AgeGrp, "\\+"), 100L, as.integer(AgeGrpStart))
+  )
+
+# ---- Reshape to long by sex, keep only Female & Male ----
+wpp_long <- wpp_za %>%
+  select(Time, age, PopFemale, PopMale) %>%
+  pivot_longer(
+    cols = c(PopFemale, PopMale),
+    names_to = "sex_raw",
+    values_to = "pop_thousands"
+  ) %>%
+  mutate(
+    sex = case_when(
+      sex_raw == "PopFemale" ~ "F",
+      sex_raw == "PopMale"   ~ "M",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(sex))
+
+# ---- Convert units (thousands -> counts), standardize columns ----
+wpp_pop <- wpp_long %>%
+  transmute(
+    year = as.integer(Time),
+    age  = as.integer(age),
+    sex  = sex,
+    pop  = as.numeric(pop_thousands) * 1000  # WPP populations are in thousands
+  ) %>%
+  arrange(year, sex, age)
+
+# ---- Sanity checks ----
+# Expect 101 ages (0..100) per sex per year
+chk <- wpp_pop %>%
+  group_by(year, sex) %>%
+  summarise(n_ages = n_distinct(age), .groups = "drop")
+print(chk)
+
+# No missing / negative pops
+stopifnot(!any(is.na(wpp_pop$pop)))
+stopifnot(all(wpp_pop$pop >= 0))
+
+# ---- Save normalized file ----
+out_file <- file.path(out_dir, "pop_age_sex.csv")
+readr::write_csv(wpp_pop, out_file)
+message("Saved: ", out_file)
+```
+
+```{r}
+# ---- Binning definitions (Option B) ----
+# Single-year: 0..14
+single_years <- 0:14
+
+# Five-year bands: 15-19, 20-24, ..., 70-74, and open-ended 75+
+five_lower <- seq(15, 70, by = 5)
+five_upper <- five_lower + 4
+
+# Build bin table
+age_bins_tbl <- tibble::tibble(
+  bin_index = seq_along(c(single_years, five_lower, 75)),
+  lower     = c(single_years, five_lower, 75),
+  upper     = c(single_years, five_upper, Inf),
+  label     = c(
+    as.character(single_years),
+    paste0(five_lower, "-", five_upper),
+    "75+"
+  )
+) %>%
+  mutate(
+    # Mark bins that intersect ages 15..44 (for CRS later)
+    CRS_relevant = (lower <= 44 & upper >= 15)
+  )
+
+# ---- Helper: map single-year ages to bin_index ----
+map_age_to_bin <- function(age_vec, bins_tbl = age_bins_tbl) {
+  sapply(age_vec, function(a) {
+    idx <- which(bins_tbl$lower <= a & a <= bins_tbl$upper)[1]
+    if (length(idx) == 0) NA_integer_ else idx
+  })
+}
+
+# ---- Aggregate the processed single-year populations into bins ----
+# Input here is wpp_pop (year, age, sex, pop) from the previous chunk
+pop_binned <- wpp_pop %>%
+  mutate(bin_index = map_age_to_bin(age)) %>%
+  filter(!is.na(bin_index)) %>%
+  group_by(year, sex, bin_index) %>%
+  summarise(pop = sum(pop), .groups = "drop") %>%
+  left_join(age_bins_tbl, by = "bin_index") %>%
+  arrange(year, sex, bin_index)
+
+# Quick sanity: each (year, sex) should sum the same as the single-year totals
+check_totals <- pop_binned %>%
+  group_by(year, sex) %>%
+  summarise(pop_binned = sum(pop), .groups = "drop") %>%
+  left_join(
+    wpp_pop %>% group_by(year, sex) %>% summarise(pop_single = sum(pop), .groups = "drop"),
+    by = c("year", "sex")
+  ) %>%
+  mutate(diff = pop_binned - pop_single)
+
+print(check_totals %>% mutate(ok = abs(diff) < 1e-6)) # all match- good.
+
+stopifnot(all(abs(check_totals$diff) < 1e-6))
+
+# ---- Save binned file ----
+out_file_binned <- file.path(out_dir, "pop_binned.csv")
+readr::write_csv(pop_binned, out_file_binned)
+message("Saved: ", out_file_binned)
+
+# Peek
+head(pop_binned, 20)
+```
+
+# Annual live births
+
+```{r}
+# Paths
+raw_path_fert <- "data/raw/WPP2024_Fertility_by_Age1.csv.gz"  # adjust extension if needed
+out_dir       <- "data/processed"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+years_keep <- 2025:2035   # keep consistent window
+
+fert_path <- "data/raw/WPP2024_Fertility_by_Age1.csv.gz"
+
+# Read just the header
+fert_header <- readr::read_csv(fert_path, n_max = 0, show_col_types = FALSE)
+fert_cols   <- names(fert_header)
+fert_cols
+
+pick_one <- function(cands, in_names) {
+  for (c in cands) if (c %in% in_names) return(c)
+  character(0)
+}
+
+col_Location <- pick_one(c("Location"), fert_cols)
+col_LocID    <- pick_one(c("LocID"), fert_cols)
+col_Variant  <- pick_one(c("Variant"), fert_cols)
+col_Time     <- pick_one(c("Time","Year"), fert_cols)
+col_AgeStart <- pick_one(c("AgeGrpStart","AgeStart"), fert_cols)
+col_AgeGrp   <- pick_one(c("AgeGrp","Age"), fert_cols)
+col_Births   <- pick_one(grep("^Births$", fert_cols, value = TRUE), fert_cols)
+col_ASFR     <- pick_one(c("ASFR","Asfr","asfr"), fert_cols)
+
+wanted <- unique(c(
+  col_Location, col_LocID, col_Variant, col_Time,
+  col_AgeStart, col_AgeGrp,
+  col_Births, col_ASFR
+))
+wanted <- wanted[wanted != ""]
+wanted
+
+# install.packages("data.table")  # if needed
+library(data.table)
+
+fert_raw <- data.table::fread(
+  fert_path,
+  select   = wanted,                              # <— only these columns
+  nThread  = max(1, parallel::detectCores()-1),   # parallel parsing
+  showProgress = TRUE
+)
+
+glimpse(fert_raw)
+```
+
+```{r}
+# ---- Parameters you can tweak ----
+years_keep   <- 2025:2035
+variant_keep <- "Constant fertility"  # <-- set to match your population variant
+# If you don't have "Constant fertility" in this file yet, use "Medium" for now:
+# variant_keep <- "Medium"
+
+# ---- 1) Filter to South Africa, years, and chosen Variant ----
+fert_za <- fert_raw %>%
+  dplyr::filter(
+    (Location == "South Africa") | (LocID == 710),
+    Time %in% years_keep
+  )
+
+# If your file contains multiple variants, keep the chosen one; otherwise skip this
+if ("Variant" %in% names(fert_za)) {
+  fert_za <- fert_za %>% dplyr::filter(Variant == variant_keep)
+  if (nrow(fert_za) == 0) {
+    warning("No rows after filtering to Variant == '", variant_keep,
+            "'. Consider switching variant_keep to 'Medium' temporarily.")
+    # Fallback: use whatever variant exists (comment this block if you want a hard stop)
+    fert_za <- fert_raw %>%
+      dplyr::filter(
+        (Location == "South Africa") | (LocID == 710),
+        Time %in% years_keep
+      )
+  }
+}
+
+stopifnot(nrow(fert_za) > 0)
+
+# ---- 2) Normalize mother’s age; cap open-ended 50+ to 50 ----
+fert_za <- fert_za %>%
+  dplyr::mutate(
+    age_mother = as.integer(AgeGrpStart),
+    age_mother = dplyr::if_else(age_mother > 50L, 50L, age_mother)
+  )
+
+# ---- 3) Aggregate births by year from the 'Births' column ----
+# WPP 'Births' in this table are in THOUSANDS for each mother's age.
+births_direct <- fert_za %>%
+  dplyr::filter(age_mother >= 15, age_mother <= 50) %>%
+  dplyr::transmute(
+    year        = as.integer(Time),
+    births_age  = as.numeric(Births) * 1000   # thousands -> counts
+  ) %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarise(births_total = sum(births_age, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(year)
+
+# ---- 4) OPTIONAL sanity check: derive births via ASFR × female population ----
+# ASFR here appears per 1000 (values > 5), so we divide by 1000.
+# If you haven’t saved pop_age_sex.csv yet, skip this block for now.
+if (file.exists("data/processed/pop_age_sex.csv")) {
+  asfr_med <- stats::median(fert_za$ASFR, na.rm = TRUE)
+  asfr_per_thousand <- is.finite(asfr_med) && asfr_med > 5
+
+  pop_f <- readr::read_csv("data/processed/pop_age_sex.csv", show_col_types = FALSE) %>%
+    dplyr::filter(sex == "F", year %in% years_keep) %>%
+    dplyr::select(year, age, pop)
+
+  births_via_asfr <- fert_za %>%
+    dplyr::filter(age_mother >= 15, age_mother <= 50) %>%
+    dplyr::transmute(
+      year = as.integer(Time),
+      age  = as.integer(age_mother),
+      ASFR = as.numeric(ASFR)
+    ) %>%
+    dplyr::inner_join(pop_f, by = c("year","age")) %>%
+    dplyr::mutate(
+      births_age = (if (asfr_per_thousand) ASFR/1000 else ASFR) * pop
+    ) %>%
+    dplyr::group_by(year) %>%
+    dplyr::summarise(births_total_asfr = sum(births_age, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(year)
+
+  births_check <- dplyr::left_join(births_direct, births_via_asfr, by = "year") %>%
+    dplyr::mutate(
+      pct_diff = 100 * (births_total_asfr - births_total) / births_total
+    )
+
+  print(births_check)
+  # differences are small, mainly due to rounding and top-age handling
+}
+
+# ---- 5) Save final births.csv for the model ----
+readr::write_csv(births_direct, file.path(out_dir, "births.csv"))
+message("Saved: ", file.path(out_dir, "births.csv"))
+
+# Peek
+head(births_direct)
+```
+
+# Coverage
+
+Create a coverage.csv dataframe to be used during the modeling. This will assume a specific coverage that can later be modified for the report.
+
+```{r}
+# ---- Parameters that can be tweaked later ----
+policy_years  <- 2025:2035
+campaign_year <- 2025         # the year the one-time catch-up happens
+routine_cov   <- 0.90         # e.g., 90% routine each year
+catchup_cov   <- 0.90         # e.g., 90% catch-up in the campaign year only
+
+# Guardrails
+stopifnot(campaign_year %in% policy_years)
+stopifnot(routine_cov >= 0 && routine_cov <= 1)
+stopifnot(catchup_cov >= 0 && catchup_cov <= 1)
+
+# Build the table
+coverage_tbl <- tibble::tibble(
+  year              = policy_years,
+  routine_coverage  = routine_cov,
+  catchup_coverage  = ifelse(year == campaign_year, catchup_cov, NA_real_)
+)
+
+# Save
+readr::write_csv(coverage_tbl, file.path(out_dir, "coverage.csv"))
+message("Saved: ", file.path(out_dir, "coverage.csv"))
+
+# Peek
+coverage_tbl
+```
+
+# Reported Rubella cases
+
+```{r}
+who_cases_path <- "data/raw/WHO Reported Rubella Cases (2012-2025).xlsx"
+
+# 1) Read the sheet with NO column names so we can build them ourselves
+raw_web <- readxl::read_xlsx(who_cases_path, sheet = "WEB", col_names = FALSE)
+
+# 2) Grab the first two rows as header lines
+hdr1 <- as.character(unlist(raw_web[1, ]))
+hdr2 <- as.character(unlist(raw_web[2, ]))
+
+# 3) Combine them into one name per column:
+#    - replace NAs with ""
+#    - collapse first + second line
+#    - squash whitespace and line breaks
+combine_hdr <- function(a, b) {
+  a <- ifelse(is.na(a), "", a)
+  b <- ifelse(is.na(b), "", b)
+  nm <- paste(a, b)
+  nm <- gsub("[\\r\\n]+", " ", nm)
+  nm <- gsub("\\s+", " ", nm)
+  nm <- trimws(nm)
+  if (nm == "") NA_character_ else nm
+}
+new_names <- mapply(combine_hdr, hdr1, hdr2, USE.NAMES = FALSE)
+
+# 4) Give fallback names to any remaining NA/empty, and ensure uniqueness
+idx_bad <- which(is.na(new_names) | new_names == "")
+new_names[idx_bad] <- paste0("col_", idx_bad)
+new_names <- make.unique(new_names)
+
+# 5) Drop the two header rows from the data and assign clean names
+who_web <- raw_web[-c(1, 2), , drop = FALSE]
+colnames(who_web) <- new_names
+
+# 6) Peek so we can see the cleaned column names and types (all character at this point)
+glimpse(who_web)
+```
+
+
+
+```{r}
+# ---- Read WHO annual rubella totals (Excel) ----
+who_cases_path <- "data/raw/WHO Reported Rubella Cases (2012-2025).xlsx"
+
+# 1) See available sheets (so we know what to read)
+who_sheets <- read_xlsx(who_cases_path, sheet = "WEB")
+
+# drop measels columns:
+who_sheets <- who_sheets[,-c(5:12, 17:19)]
+colnames(who_sheets)[1:4] <- who_sheets[1,1:4]
+colnames(who_sheets)[5:8] <- who_sheets[2,5:8]
+who_sheets <- who_sheets[-c(1,2),]
+
+glimpse(who_sheets)
+```
+
+```{r}
+# ---- Clean WHO "WEB" sheet into annual totals for South Africa ----
+
+# 1) Filter to South Africa rows
+who_za <- who_sheets %>%
+  dplyr::filter(
+    `Member State` == "South Africa" | `ISO country code` %in% c("ZAF","ZAF ") # robust to stray spaces
+  )
+
+glimpse(who_za)
+
+to_num <- function(x) as.integer(gsub("[^0-9-]", "", x))
+
+cases_annual <- who_za %>%
+  dplyr::transmute(
+    year = as.integer(gsub("[^0-9]", "", Year)),
+    cases_reported_total = to_num(`Lab confirmed`)
+  ) %>%
+  dplyr::filter(!is.na(year)) %>%
+  dplyr::arrange(year)
+
+# Save to our canonical location for the model
+readr::write_csv(cases_annual, file.path(out_dir, "cases.csv"))
+message("Saved: ", file.path(out_dir, "cases.csv"))
+
+# Choose your main fitting window (edit as needed)
+fit_years <- 2012:2019  # stable years prior to covid
+
+# Filter to fitting window & drop any NA/partial years
+cases_fit <- cases_annual %>%
+  dplyr::filter(year %in% fit_years, !is.na(cases_reported_total))
+
+# Save a separate file specifically for fitting
+readr::write_csv(cases_fit, "data/processed/cases_fit.csv")
+message("Saved: data/processed/cases_fit.csv")
+```
+
+# Pregnancy prevalence
+
+A proxy of the proportion of women who are pregnant each year at each age group.
+
+```{r}
+# ---- Build pregnancy_prevalence.csv from fertility-by-age ----
+# Assumptions:
+# - Variant should match the population pull (you used "Constant fertility")
+# - ASFR (age-specific fertility rate) units look like per 1000 women (values > 5)
+
+years_keep   <- 2025:2035
+variant_keep <- "Constant fertility"   # match your population/ births choice
+duration_years <- 40/52 # ~0.769; how long someone is pregnant in a year
+
+fert_pp <- fert_raw %>%
+  dplyr::filter(
+    (Location == "South Africa") | (LocID == 710),
+    Time %in% years_keep,
+    Variant == variant_keep
+  ) %>%
+  dplyr::transmute(
+    year = as.integer(Time),
+    age  = as.integer(AgeGrpStart),
+    ASFR = as.numeric(ASFR)
+  ) %>%
+  # Keep reproductive ages; cap open-ended if present
+  dplyr::filter(age >= 15, age <= 50)
+
+# Detect if ASFR is per 1000 women (likely true here)
+asfr_med <- stats::median(fert_pp$ASFR, na.rm = TRUE)
+asfr_per_thousand <- is.finite(asfr_med) && asfr_med > 5
+
+fert_pp <- fert_pp %>%
+  dplyr::mutate(
+    asfr_per_woman = if (asfr_per_thousand) ASFR/1000 else ASFR,
+    # Approximate point prevalence of pregnancy at age a:
+    prev_raw = asfr_per_woman * duration_years
+  )
+
+# a single stable age profile averaged over the policy years
+preg_prev <- fert_pp %>%
+  dplyr::group_by(age) %>%
+  dplyr::summarise(prev = mean(prev_raw, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(
+    # Clip to [0,1] for safety
+    prev = pmax(0, pmin(prev, 1))
+  ) %>%
+  dplyr::filter(age >= 15, age <= 44) %>%
+  dplyr::arrange(age)
+
+# Save
+readr::write_csv(preg_prev, file.path(out_dir, "pregnancy_prevalence.csv"))
+message("Saved: ", file.path(out_dir, "pregnancy_prevalence.csv"))
+
+# Peek
+head(preg_prev)
+summary(preg_prev$prev)
+```
+
