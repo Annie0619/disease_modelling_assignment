@@ -431,87 +431,71 @@ summary(preg_prev$prev)
 # Mortality rate
 
 ```{r}
-# ---- Paths and choices ----
-lt_path    <- "data/raw/WPP2024_Life_Table_Abridged_Medium_2024-2100.csv.gz"
-proc_dir   <- "data/processed"
-dir.create(proc_dir, showWarnings = FALSE, recursive = TRUE)
+# Re-read abridged life table (only needed columns)
+lt_path  <- "data/raw/WPP2024_Life_Table_Abridged_Medium_2024-2100.csv.gz"
+proc_dir <- "data/processed"
+mort_years <- 2025:2035  # or just start_year if you prefer baseline-only
 
-# Choose which years of hazards to build (baseline only is fine; or a range)
-mort_years <- 2025:2035  # adjust as needed
-
-# ---- Header peek (you posted these already) ----
-# names(readr::read_csv(lt_path, n_max = 0, show_col_types = FALSE))
-
-# ---- Read only needed columns (fast) ----
 lt_small <- readr::read_csv(
   lt_path,
   col_select = c("Location","LocID","Variant","Time","Sex","AgeGrp","AgeGrpStart","AgeGrpSpan","mx","qx"),
   show_col_types = FALSE
 )
 
-# ---- Filter to South Africa, chosen years, and the matching variant ----
 lt_za <- lt_small %>%
   dplyr::filter(
     (Location == "South Africa") | (LocID == 710),
     Time %in% mort_years,
-    Variant == "Medium"  # your file is the Medium variant
+    Variant == "Medium"
   ) %>%
   dplyr::mutate(
-    sex = dplyr::case_when(Sex %in% c("Female","F") ~ "F",
-                           Sex %in% c("Male","M")   ~ "M",
-                           TRUE ~ NA_character_),
+    sex       = dplyr::case_when(Sex %in% c("Female","F") ~ "F",
+                                 Sex %in% c("Male","M")   ~ "M",
+                                 TRUE ~ NA_character_),
     age_start = as.integer(AgeGrpStart),
-    span      = as.integer(AgeGrpSpan)
+    span_raw  = as.integer(AgeGrpSpan)
   ) %>%
-  dplyr::select(Time, sex, age_start, span, qx, mx)
+  dplyr::select(Time, sex, age_start, span_raw, qx, mx)
 
-# ---- Compute a continuous hazard per band ----
-# Prefer qx if present; fall back to mx (central death rate) if qx is missing.
-# For open-ended 100+ (span is NA), set span = 1 and cap age_start at 100.
+# Continuous hazard per band; set span for open-ended band to reach age 100
 lt_haz <- lt_za %>%
   dplyr::mutate(
-    span = dplyr::if_else(is.na(span), 1L, span),
+    # span: if open-ended (NA), extend to age 100 inclusive
+    span = dplyr::if_else(is.na(span_raw), 101L - pmin(age_start, 100L), span_raw),
     age_start = pmin(age_start, 100L),
-    # Guardrails for qx
-    qx = dplyr::if_else(is.na(qx), NA_real_, pmin(pmax(qx, 0), 0.999999)),
-    # Compute mu per band
+    qx  = dplyr::if_else(is.na(qx), NA_real_, pmin(pmax(qx, 0), 0.999999)),
     mu_band = dplyr::case_when(
-      !is.na(qx) ~ -log(1 - qx) / pmax(span, 1L),
-      is.na(qx) & !is.na(mx) ~ as.numeric(mx),     # mx is close to a continuous hazard
-      TRUE ~ NA_real_
+      !is.na(qx)              ~ -log(1 - qx) / pmax(span, 1L),
+      is.na(qx) & !is.na(mx)  ~ as.numeric(mx),   # fallback to central death rate
+      TRUE                    ~ NA_real_
     )
   ) %>%
-  dplyr::filter(!is.na(mu_band))
+  dplyr::filter(!is.na(sex), !is.na(mu_band), !is.na(span), span > 0)
 
-# ---- Expand bands to single-year ages ----
-# For each row (band), create 'span' rows: ages = age_start, age_start+1, ..., age_start+span-1
-# Cap ages at 100 so the top open-ended group maps to age 100 only.
-lt_expanded <- lt_haz %>%
-  dplyr::mutate(n_years = pmin(span, 101L - age_start)) %>%
-  dplyr::filter(n_years > 0) %>%
-  tidyr::uncount(weights = n_years, .id = "rep_id") %>%
-  dplyr::mutate(
-    age = pmin(age_start + rep_id - 1L, 100L)
-  ) %>%
-  dplyr::select(
-    year = Time, sex, age, mu = mu_band
-  ) %>%
-  dplyr::arrange(year, sex, age)
-
-# ---- Keep exactly ages 0..100 per year/sex (deduplicate if overlaps) ----
-# If there are overlaps (shouldn't be, but just in case), take the first occurrence.
-lt_singleyear <- lt_expanded %>%
-  dplyr::group_by(year, sex, age) %>%
-  dplyr::slice(1) %>%
+# Keep one row per age (0..99) within each year–sex slice
+lt_0_99 <- lt_expanded %>%
+  dplyr::group_by(year, sex) %>%
+  dplyr::arrange(age, .by_group = TRUE) %>%
+  dplyr::distinct(age, .keep_all = TRUE) %>%  # replaces slice_unique()
   dplyr::ungroup()
 
-# ---- Guardrails ----
-stopifnot(all(lt_singleyear$age >= 0 & lt_singleyear$age <= 100))
-stopifnot(all(is.finite(lt_singleyear$mu)))
-# Expect 2 sexes * 101 ages * length(mort_years) rows
-# print(dplyr::count(lt_singleyear, year, sex, name = "n_ages"))
+# Create an age-100 row by copying the last hazard in each (year, sex)
+lt_age100 <- lt_0_99 %>%
+  dplyr::group_by(year, sex) %>%
+  dplyr::summarise(mu = dplyr::last(mu), .groups = "drop") %>%
+  dplyr::mutate(age = 100L) %>%
+  dplyr::select(year, sex, age, mu)
 
-# ---- Save for the model (single-year hazards per year/sex/age) ----
+# Bind and sort
+lt_singleyear <- dplyr::bind_rows(lt_0_99, lt_age100) %>%
+  dplyr::arrange(year, sex, age)
+
+# Guardrail: expect 101 ages per (year, sex)
+chk <- lt_singleyear %>%
+  dplyr::count(year, sex, name = "n_ages")
+print(chk)  # should show n_ages == 101
+
+# Save
 readr::write_csv(lt_singleyear, file.path(proc_dir, "mortality_singleyear.csv"))
 message("Saved: ", file.path(proc_dir, "mortality_singleyear.csv"))
 ```
