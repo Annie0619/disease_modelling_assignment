@@ -47,6 +47,12 @@ births_df   <- readr::read_csv(file.path(proc_dir, "births.csv"), show_col_types
 coverage_df <- readr::read_csv(file.path(proc_dir, "coverage.csv"), show_col_types = FALSE)
 preg_prev   <- readr::read_csv(file.path(proc_dir, "pregnancy_prevalence.csv"), show_col_types = FALSE)
 
+# ---- calibration: load WHO fit data ----
+# Uses data/processed/cases_fit.csv that was created in Data prep
+cases_fit <- readr::read_csv("data/processed/cases_fit.csv", show_col_types = FALSE)
+stopifnot(all(c("year","cases_reported_total") %in% names(cases_fit)))
+
+
 # ---- guardrails: inputs must cover sim years & plausible ranges ----
 stopifnot(all(sim_years %in% unique(mu_tbl$year)))
 stopifnot(all(sim_years %in% unique(births_df$year)))
@@ -190,119 +196,94 @@ cat(sprintf("Prev_I0 = %.8f (%.3f per 100k)\n", prev_I0, prev_I0*1e5))
 
 ```
 
-# Test the R0 and rho values found in literature
+# Validate the R0 and rho values found in literature
 
 ```{r}
-# ---- Literature-based priors (you can tweak) ----
-R0_lit_central <- 7.5        # SA-specific anchor (use 6–8 in sensitivity)
-rho_lit_central <- 0.005      # 1% reporting; try 0.005–0.02 in sensitivity
+# ---- calibration: validation-only obs vs exp (literature-locked) ----
+# Fitting/validation window and reference demography for stationary runs
+fit_years      <- 2012:2019
+fit_ref_demog  <- start_year         # use mortality from policy start for stationary demography
+R0_lit_central <- 7.5                # literature anchor
+rho_lit_central <- 0.005             # literature anchor for reporting
 
-# Derived transmission rate (beta = R0 * gamma)
-parms_locked <- list(
+# Parameters for the stationary, no-vaccination fit-window run
+parms_fit <- list(
   sigma = 1 / latent_period_years,
   gamma = 1 / infectious_period_years,
   beta  = R0_lit_central * (1 / infectious_period_years),
   rho   = rho_lit_central,
   VE    = VE,
-  eps   = 1e-8               # tiny importation floor (keeps low-level circulation)
+  eps   = 1e-8
 )
 
-# Optional: brief burn-in to reach endemic state consistent with locked R0
-burn_in_years_locked <- 20
-y_start_locked <- burn_in_mdl(
+# Burn-in ending just before the first fit year, under the same parameters
+burnin_years_fit <- 20
+y_burn_fit <- burn_in_mdl(
   y_start    = y0,
-  start_year = start_year,
-  K          = burn_in_years_locked,
-  pr         = parms_locked,
+  start_year = min(fit_years),
+  K          = burnin_years_fit,
+  pr         = parms_fit,
   mdl        = mdl,
-  ref_year   = start_year,
+  ref_year   = fit_ref_demog,
   share_F    = share_F,
   share_M    = share_M
 )
 
-# ---- Baseline run (no special catch-up beyond what's in coverage_df) ----
-baseline_locked <- run_horizon_mdl(
-  y_start     = y_start_locked,
-  start_year  = start_year,
-  n_years     = horizon_years,
-  pr          = parms_locked,
-  mdl         = mdl,
-  share_F     = share_F,
-  share_M     = share_M,
-  crs_parms   = crs_parms,
-  tri_weights = tri_weights
-)
-
-baseline_locked$results
-
-
-# ---- Expected reported cases for a fixed beta & rho over 2012–2019 ----
-fit_years <- 2012:2019
-fit_ref_demog <- start_year        # use stationary demography at start_year
-
-expected_reported_for_locked <- function(beta_val, rho_val,
-                                         fit_years, mdl, share_F, share_M,
-                                         ref_year, burnin_years = 20,
-                                         latent_period_years, infectious_period_years) {
-  pr_here <- list(
-    sigma = 1 / latent_period_years,
-    gamma = 1 / infectious_period_years,
-    beta  = beta_val,
-    rho   = rho_val,
-    VE    = VE,
-    eps   = 1e-8
-  )
-  # burn-in ending before first fit year
-  y_burn <- burn_in_mdl(
-    y_start    = y0,
-    start_year = min(fit_years),
-    K          = burnin_years,
-    pr         = pr_here,
-    mdl        = mdl,
-    ref_year   = ref_year,
-    share_F    = share_F,
-    share_M    = share_M
-  )
-  # simulate fit years (no vax; stationary demography)
-  sim <- run_stationary_novax(
-    y_start = y_burn,
-    years   = fit_years,
-    pr      = pr_here,
-    mdl     = mdl,
-    ref_year = ref_year,
-    share_F = share_F,
-    share_M = share_M
-  )
-  sim$results |>
-    dplyr::mutate(mu = rho_val * infections_total) |>
-    dplyr::select(year, mu)
-}
-
-# Build comparison table and a simple plot
-exp_locked <- expected_reported_for_locked(
-  beta_val = parms_locked$beta,
-  rho_val  = parms_locked$rho,
-  fit_years = fit_years,
-  mdl = mdl, share_F = share_F, share_M = share_M,
+# Stationary, no-vaccination simulation across fit years
+sim_fit <- run_stationary_novax(
+  y_start = y_burn_fit,
+  years   = fit_years,
+  pr      = parms_fit,
+  mdl     = mdl,
   ref_year = fit_ref_demog,
-  latent_period_years = latent_period_years,
-  infectious_period_years = infectious_period_years
+  share_F = share_F,
+  share_M = share_M
 )
 
-fit_compare_locked <- cases_fit |>
-  dplyr::filter(year %in% fit_years) |>
-  dplyr::inner_join(exp_locked, by = "year") |>
-  dplyr::rename(obs = cases_reported_total, pred = mu)
+# Observed vs expected (literature-locked)
+fit_compare_locked <- cases_fit %>%
+  dplyr::filter(year %in% fit_years) %>%
+  dplyr::inner_join(sim_fit$results %>% dplyr::select(year, infections_total), by = "year") %>%
+  dplyr::transmute(
+    year,
+    obs = cases_reported_total,
+    exp_locked = parms_fit$rho * infections_total
+  )
 
 print(fit_compare_locked)
 
+# Optional: a one-parameter rescale of rho to match mean level (not a full likelihood fit)
+rho_hat <- sum(fit_compare_locked$obs, na.rm = TRUE) / sum(sim_fit$results$infections_total, na.rm = TRUE)
+fit_compare_scaled <- fit_compare_locked %>%
+  dplyr::mutate(exp_scaled = rho_hat * (sim_fit$results$infections_total[match(year, sim_fit$results$year)]))
+
+cat(sprintf("rho_lit_central = %.5f; rho_hat (mean-level) = %.5f\n", rho_lit_central, rho_hat))
+
+# Quick plot: Observed vs Expected
 plot(fit_compare_locked$year, fit_compare_locked$obs, type = "b", pch = 16,
      xlab = "Year", ylab = "Reported cases",
-     main = "Observed vs expected (locked R0, rho; stationary demography)")
-lines(fit_compare_locked$year, fit_compare_locked$pred, type = "b", pch = 1, lty = 2)
-legend("topright", legend = c("Observed", "Expected"), pch = c(16,1), lty = c(1,2))
-```
+     main = "Observed vs expected (literature-locked R0, rho; stationary demography)", ylim = c(0, max(fit_compare_locked$exp_locked)))
+lines(fit_compare_locked$year, fit_compare_locked$exp_locked, type = "b", pch = 1, lty = 2)
+legend("topright", legend = c("Observed", "Expected (literature)"),
+       pch = c(16,1), lty = c(1,2), bty = "n")
 
+# (Optional) Overlay the level-matched expected series
+lines(fit_compare_scaled$year, fit_compare_scaled$exp_scaled, type = "b", pch = 0, lty = 3)
+legend("topleft", legend = c("Expected (scaled rho)"), pch = 0, lty = 3, bty = "n")
+
+
+# only plot scaled rho with observed
+plot(fit_compare_locked$year, fit_compare_locked$obs, type = "b", pch = 16,
+     xlab = "Year", ylab = "Reported cases",
+     main = "Observed vs expected (literature-locked R0, rho; stationary demography)", ylim = c(0, max(fit_compare_scaled$exp_scaled)))
+#lines(fit_compare_locked$year, fit_compare_locked$exp_locked, type = "b", pch = 1, lty = 2)
+lines(fit_compare_scaled$year, fit_compare_scaled$exp_scaled, type = "b", pch = 0, lty = 3)
+legend("topright", legend = c("Observed", "Expected (scaled rho)"),
+       pch = c(16,0), lty = c(1,3), bty = "n")
+
+legend("topright", legend = c("Expected (scaled rho)"), pch = 0, lty = 3, bty = "n")
+
+```
 
 # Add diagnostics for mean age of infection
 
@@ -408,6 +389,382 @@ make_coverage_scenario <- function(years, p_routine, campaign_year = NULL, p_cat
   }
   cov
 }
+```
+
+```{r}
+# define and run scenarios
+# ---------------------------------------------
+# Helper: shallow-clone the model and override coverage
+clone_with_coverage <- function(mdl, coverage_new) {
+  mdl2 <- mdl
+  mdl2$coverage_df <- coverage_new
+  mdl2
+}
+
+# ---------------------------------------------
+# Policy years we will simulate
+years_policy <- start_year:(start_year + horizon_years - 1)
+
+# ---------------------------------------------
+# Define locked literature parameters/burn-in
+R0_lit_central   <- 7.9            # SA anchor; vary in sensitivity later
+rho_lit_central  <- 0.01
+
+parms_locked <- list(
+  sigma = 1 / latent_period_years,
+  gamma = 1 / infectious_period_years,
+  beta  = R0_lit_central * (1 / infectious_period_years),
+  rho   = rho_lit_central,
+  VE    = VE,
+  eps   = 1e-8
+  )
+
+y_start_locked <- burn_in_mdl(
+ y_start    = y0,
+  start_year = start_year,
+  K          = 30, # 30 year burn in
+  pr         = parms_locked,
+  mdl        = mdl,
+  ref_year   = start_year,
+  share_F    = share_F,
+  share_M    = share_M
+)
+
+# ---------------------------------------------
+# Define a small, clear scenario set
+scenarios <- tibble::tibble(
+  id    = c("baseline80",         "baseline90",
+            "catchup90_r80",      "catchup90_r90",
+            "delay3y_catchup90_r90"),
+  label = c("Routine 80% (no catch-up)",
+            "Routine 90% (no catch-up)",
+            "Catch-up 1–14 @90% + Routine 80%",
+            "Catch-up 1–14 @90% + Routine 90%",
+            "Delay 3y then Catch-up 1–14 @90% + Routine 90%"),
+  routine = c(0.80, 0.90, 0.80, 0.90, 0.90),
+  catch_year = c(NA, NA, start_year, start_year, start_year + 3),
+  catch_cov  = c(NA, NA, 0.90, 0.90, 0.90)
+)
+
+# ---------------------------------------------
+# Runner over scenarios
+scenario_results <- list()
+for (i in seq_len(nrow(scenarios))) {
+  sc <- scenarios[i, ]
+
+  # Build coverage table for this scenario
+  cov_tbl <- make_coverage_scenario(
+    years        = years_policy,
+    p_routine    = sc$routine,
+    campaign_year = if (is.na(sc$catch_year)) NULL else sc$catch_year,
+    p_catchup     = if (is.na(sc$catch_cov))  NULL else sc$catch_cov
+  )
+
+  # For the "delay 3y" scenario: enforce routine=0 and no catch-up during the delay years,
+  # then apply the planned campaign & routine from the specified catch_year onward.
+  if (sc$id == "delay3y_catchup90_r90") {
+    delay_years <- start_year:(start_year + 2)
+    cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
+    cov_tbl$catchup_coverage[cov_tbl$year %in% delay_years] <- NA_real_
+  }
+
+  # Clone model with this scenario's coverage
+  mdl_sc <- clone_with_coverage(mdl, cov_tbl)
+
+  # Run the horizon with paradox diagnostics
+  run_sc <- run_horizon_with_paradox(
+    y_start     = y_start_locked,     # from your literature-locked burn-in
+    start_year  = start_year,
+    n_years     = horizon_years,
+    pr          = parms_locked,       # literature-locked parameters
+    mdl         = mdl_sc,
+    share_F     = share_F,
+    share_M     = share_M,
+    crs_parms   = crs_parms,
+    tri_weights = tri_weights
+  )
+
+  # Summaries for reporting
+  df <- run_sc$results
+  out_row <- tibble::tibble(
+    id    = sc$id,
+    label = sc$label,
+    routine = sc$routine,
+    catch_year = sc$catch_year,
+    catch_cov  = sc$catch_cov,
+    CRS10      = sum(df$crs, na.rm = TRUE),
+    cum_inf_F1544 = sum(df$inf_F1544, na.rm = TRUE),
+    mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
+  )
+
+  scenario_results[[sc$id]] <- list(summary = out_row, timeseries = df, coverage = cov_tbl)
+}
+
+# ---------------------------------------------
+# Collect summary table across scenarios (primary view for the report)
+scenario_summary <- dplyr::bind_rows(lapply(scenario_results, `[[`, "summary")) |>
+  dplyr::arrange(CRS10)
+
+```
+
+How much better is this than baseline: baseline = 
+
+```{r}
+# ---------------------------------------------
+# Add CRS averted vs baseline (baseline = Routine 80% no catch-up)
+baseline_id <- "baseline80"
+
+stopifnot(baseline_id %in% scenario_summary$id)
+CRS10_baseline <- scenario_summary$CRS10[scenario_summary$id == baseline_id]
+
+scenario_summary <- scenario_summary |>
+  dplyr::mutate(
+    CRS10_averted = CRS10_baseline - CRS10
+  ) |>
+  dplyr::arrange(dplyr::desc(CRS10_averted))
+```
+
+# Sensitivity check
+
+```{r}
+# ---------------------------------------------
+# Expanded sensitivity grid definitions
+# - R0: keep literature-reasonable values
+# - Routine: 50%..95% in 5% steps
+# - Catch-up: 0%..95% in 10% steps (0 means no campaign)
+# - Campaign timing: immediate (start_year) vs delayed (+3y)
+
+R0_vals_exp       <- c(6.0, 7.0, 8.0)
+routine_vals_exp  <- seq(0.50, 0.95, by = 0.05)
+catch_vals_exp    <- seq(0.00, 0.95, by = 0.10)  # 0 = no catch-up
+campaign_year_opts <- c(start_year, start_year + 1, start_year + 2)  # immediate vs 3-year delay
+```
+
+
+```{r}
+# ---------------------------------------------
+# Run the expanded grid
+# For each (R0, routine, catch-up %), evaluate:
+#   - immediate campaign at start_year
+#   - delayed campaign (start_year + 3)
+# Special case: if catch-up == 0, we only run "no campaign" (i.e., 'immediate' slot carries no campaign).
+
+sens_rows_exp <- list()
+row_id <- 0L
+
+for (R0v in R0_vals_exp) {
+
+  # Copy literature-locked params, swap beta to match this R0 (beta = R0 * gamma)
+  parms_sens <- parms_locked
+  parms_sens$beta <- R0v * parms_locked$gamma
+
+  for (pr in routine_vals_exp) {
+    for (pc in catch_vals_exp) {
+
+      # If no catch-up (pc == 0), evaluate one "no-campaign" case only.
+      # Otherwise, evaluate both immediate and delayed campaigns.
+      camp_years_this <- if (pc == 0) NA_integer_ else campaign_year_opts
+
+      for (cy in camp_years_this) {
+
+        # Build coverage table
+        cov_tbl <- make_coverage_scenario(
+          years         = years_policy,
+          p_routine     = pr,
+          campaign_year = if (is.na(cy)) NULL else cy,
+          p_catchup     = if (is.na(cy)) NULL else pc
+        )
+
+        # If the scenario is "delayed", ensure there is NO vaccination during the delay window
+        if (!is.na(cy) && cy > start_year) {
+          delay_years <- start_year:(cy - 1L)
+          cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
+          cov_tbl$catchup_coverage[cov_tbl$year %in% delay_years] <- NA_real_
+        }
+
+        # Clone model with scenario-specific coverage
+        mdl_sc <- clone_with_coverage(mdl, cov_tbl)
+
+        # Run 10-year horizon with paradox diagnostics
+        run_sc <- run_horizon_with_paradox(
+          y_start     = y_start_locked,
+          start_year  = start_year,
+          n_years     = horizon_years,
+          pr          = parms_sens,
+          mdl         = mdl_sc,
+          share_F     = share_F,
+          share_M     = share_M,
+          crs_parms   = crs_parms,
+          tri_weights = tri_weights
+        )
+
+        df <- run_sc$results
+
+        row_id <- row_id + 1L
+        sens_rows_exp[[row_id]] <- tibble::tibble(
+          R0          = R0v,
+          routine     = pr,
+          catchup     = pc,
+          campaign    = if (pc == 0) "none" else if (cy == start_year) "immediate" else "delayed3y",
+          campaign_year = if (pc == 0) NA_integer_ else cy,
+          CRS10       = sum(df$crs, na.rm = TRUE),
+          cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
+          mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
+        )
+      }
+    }
+  }
+}
+
+sens_expanded <- dplyr::bind_rows(sens_rows_exp)
+```
+
+```{r}
+# ---------------------------------------------
+# Define baseline for "CRS averted" comparisons:
+#   routine = 0.80, catchup = 0, (campaign='none') at each R0
+# This gives a baseline per R0 so differences are fair within that transmission setting.
+
+baseline_key <- sens_expanded |>
+  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") |>
+  dplyr::select(R0, baseline_CRS10 = CRS10)
+
+sens_expanded2 <- sens_expanded |>
+  dplyr::left_join(baseline_key, by = "R0") |>
+  dplyr::mutate(
+    CRS10_averted = baseline_CRS10 - CRS10
+  )
+
+# Quick view: best options per R0 (top 10 by CRS averted)
+best_per_R0 <- sens_expanded2 |>
+  dplyr::group_by(R0) |>
+  dplyr::arrange(dplyr::desc(CRS10_averted), .by_group = TRUE) |>
+  dplyr::slice_head(n = 10L) |>
+  dplyr::ungroup()
+
+#knitr::kable(
+#  best_per_R0,
+#  digits = c(2, 2, 2, NA, 0, 0, 0, 2),
+#  caption = "Top 10 scenarios per R0 by CRS averted (vs routine 80%, no catch-up)."
+#)
+
+# Save full grid and top table
+#out_dir <- "outputs"
+#if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+#readr::write_csv(sens_expanded2, file.path(out_dir, "sensitivity_grid_expanded.csv"))
+#readr::write_csv(best_per_R0,   file.path(out_dir, "sensitivity_grid_top10_by_R0.csv"))
+```
+
+## CRS Heatmap
+
+```{r}
+# ---------------------------------------------
+# Heatmaps of CRS averted, plus paradox markers
+library(ggplot2)
+
+# 1) CRS averted heatmap (per R0, by campaign timing)
+ggplot(sens_expanded2, aes(x = routine, y = catchup, fill = CRS10_averted)) +
+  geom_tile() +
+  facet_grid(R0 ~ campaign, labeller = label_both) +
+  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05)) +
+  scale_y_continuous("Catch-up coverage", breaks = seq(0.0, 0.95, by = 0.10)) +
+  labs(title = "CRS averted vs baseline (routine 80%, no catch-up)",
+       subtitle = "Facets by R0 and campaign timing; higher = better") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+# 2) Add paradox flag (TRUE if cum_inf_F1544 <= baseline at same R0)
+#    First compute the baseline cum_inf_F1544 per R0 (routine=0.80, catchup=0, campaign='none')
+baseline_infF <- sens_expanded2 |>
+  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") |>
+  dplyr::select(R0, base_infF = cum_inf_F1544)
+
+sens_plot <- sens_expanded2 |>
+  dplyr::left_join(baseline_infF, by = "R0") |>
+  dplyr::mutate(
+    paradox_ok = cum_inf_F1544 <= base_infF + 1e-9  # allow tiny numerical wiggle
+  )
+
+# Heatmap with markers: red "✖" where paradox is violated
+ggplot(sens_plot, aes(x = routine, y = catchup, fill = CRS10_averted)) +
+  geom_tile() +
+  geom_point(data = subset(sens_plot, !paradox_ok),
+             aes(x = routine, y = catchup),
+             shape = 4, size = 2.2, stroke = 1.1, color = "red") +
+  facet_grid(R0 ~ campaign, labeller = label_both) +
+  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05)) +
+  scale_y_continuous("Catch-up coverage", breaks = seq(0.0, 0.95, by = 0.10)) +
+  labs(title = "CRS averted with paradox violations marked",
+       subtitle = "Red ✖ indicates infections in females 15–44 increased vs baseline") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+# Optional: save to disk
+#out_dir <- "outputs"
+#if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+#ggsave(file.path(out_dir, "heatmap_CRS_averted.png"), width = 10, height = 7, dpi = 300)
+#ggsave(file.path(out_dir, "heatmap_CRS_averted_paradox.png"), width = 10, height = 7, dpi = 300)
+```
+
+```{r}
+# Keep only panels where catch-up actually varies
+df_heat <- sens_expanded2 |> dplyr::filter(campaign != "none")
+
+library(ggplot2)
+
+# Heatmap: CRS averted, only for "now" and "delay3y"
+p_heat <- ggplot(df_heat, aes(x = routine, y = catchup, fill = CRS10_averted)) +
+  geom_tile() +
+  facet_grid(R0 ~ campaign, labeller = label_both) +
+  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
+  scale_y_continuous("Catch-up coverage", breaks = seq(0, 0.95, by = 0.10), limits = c(0, 0.95)) +
+  labs(title = "CRS averted vs baseline (routine 80%, no catch-up)",
+       subtitle = "Panels only where catch-up occurs") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+p_heat
+
+# Optional paradox overlay (red ✖ where paradox is violated)
+baseline_infF <- sens_expanded2 |>
+  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") |>
+  dplyr::select(R0, base_infF = cum_inf_F1544)
+
+df_heat_mark <- df_heat |>
+  dplyr::left_join(baseline_infF, by = "R0") |>
+  dplyr::mutate(paradox_ok = cum_inf_F1544 <= base_infF + 1e-9)
+
+p_heat_mark <- ggplot(df_heat_mark, aes(x = routine, y = catchup, fill = CRS10_averted)) +
+  geom_tile() +
+  geom_point(data = subset(df_heat_mark, !paradox_ok),
+             aes(x = routine, y = catchup),
+             shape = 4, size = 2.2, stroke = 1.1, color = "red") +
+  facet_grid(R0 ~ campaign, labeller = label_both) +
+  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
+  scale_y_continuous("Catch-up coverage", breaks = seq(0, 0.95, by = 0.10), limits = c(0, 0.95)) +
+  labs(title = "CRS averted (paradox violations marked)",
+       subtitle = "Red ✖ indicates infections in females 15–44 increased vs baseline") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+p_heat_mark
+
+# Separate, simple plot for "no campaign" (catchup = 0 always)
+df_none <- sens_expanded2 |> dplyr::filter(campaign == "none") |>
+  dplyr::arrange(R0, routine)
+
+p_none <- ggplot(df_none, aes(x = routine, y = CRS10_averted, group = R0, color = as.factor(R0))) +
+  geom_line() + geom_point() +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
+  labs(y = "CRS averted (10y) vs baseline", color = "R0",
+       title = "Routine-only policies (no catch-up)") +
+  theme_minimal(base_size = 12)
+
+p_none
 ```
 
 

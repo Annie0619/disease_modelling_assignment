@@ -365,4 +365,94 @@ burn_in_mdl <- function(y_start, start_year, K, pr, mdl, ref_year, share_F, shar
   y
 }
 
+# ----------------------------------------------
+# ---- run_stationary_novax -----------------------------------------------
+# Simulate a set of calendar years with:
+#   - stationary demography (mortality fixed at ref_year),
+#   - replacement births to keep N approximately stable,
+#   - zero vaccination (routine=0, no catch-up).
+#
+# Inputs:
+#   y_start   : state vector at the start of the first year in `years`
+#   years     : integer vector of years to simulate (e.g., 2012:2019)
+#   pr        : parameter list (sigma, gamma, beta, rho, VE, eps)
+#   mdl       : model object from build_model()
+#   ref_year  : year whose mortality is used for all steps (stationary demography)
+#   share_F/M : sex ratio splitting for births
+#
+# Returns:
+#   list(results = tibble with yearly infections_total, reported_cases, crs,
+#                 plus optional diagnostics if desired),
+#        y_final = state vector at end of the last simulated year)
+run_stationary_novax <- function(y_start, years, pr, mdl, ref_year, share_F, share_M) {
+  stopifnot(length(years) > 0, is.numeric(years))
+  yrs <- sort(unique(as.integer(years)))
+  
+  # Zero-coverage table for the provided years
+  cov_zero <- tibble::tibble(
+    year = yrs,
+    routine_coverage = 0,
+    catchup_coverage = NA_real_
+  )
+  
+  # Use stationary births each year (constant on the ref year’s total),
+  # then override with "replacement births" inside the one-year simulator.
+  births_stat <- make_stationary_births(mdl$births_df, yrs, ref_year = ref_year)
+  
+  # Fixed mortality from ref_year for all years
+  mu_ref <- mdl$mu_lookup[[as.character(ref_year)]]
+  if (is.null(mu_ref)) stop("run_stationary_novax: no mortality for ref_year = ", ref_year)
+  
+  out <- tibble::tibble(
+    year = integer(),
+    infections_total = double(),
+    reported_cases   = double(),
+    crs              = double()
+  )
+  
+  y_curr <- y_start
+  
+  for (yr in yrs) {
+    # Reset annual accumulators before integrating
+    y_curr[mdl$idx$C_F]   <- 0
+    y_curr[mdl$idx$C_tot] <- 0
+    
+    # Integrate one calendar year with:
+    #  - fixed mortality (mu_year_override = mu_ref),
+    #  - zero vaccination (cov_zero),
+    #  - replacement_births = TRUE to keep N ~ stable
+    res <- simulate_one_year_custom_mdl(
+      y_start  = y_curr,
+      year_int = yr,
+      pr       = pr,
+      mdl      = mdl,
+      coverage_tbl = cov_zero[cov_zero$year == yr, , drop = FALSE],
+      births_tbl   = births_stat[births_stat$year == yr, , drop = FALSE],
+      share_F = share_F, share_M = share_M,
+      mu_year_override   = mu_ref,
+      replacement_births = TRUE
+    )
+    
+    # Read accumulators BEFORE events are applied (already built into simulate_one_year_custom_mdl flow)
+    y_pre <- as.numeric(res$trajectory[nrow(res$trajectory), -1])
+    C_F_end   <- y_pre[mdl$idx$C_F]
+    C_tot_end <- as.numeric(y_pre[mdl$idx$C_tot])
+    
+    # Compute CRS with existing helper
+    crs_year <- crs_from_infections_mdl(C_F_end, mdl, r = pr$crs_parms %||% list(r1 = 0.90, r2 = 0.25, r3 = 0.01),
+                                        w = pr$tri_weights %||% c(w1 = 1/3, w2 = 1/3, w3 = 1/3))
+    
+    out <- dplyr::bind_rows(out, tibble::tibble(
+      year = yr,
+      infections_total = C_tot_end,
+      reported_cases   = if (!is.null(pr$rho) && is.finite(pr$rho)) pr$rho * C_tot_end else NA_real_,
+      crs              = crs_year
+    ))
+    
+    # Move to next year (post-events state)
+    y_curr <- res$y_next
+  }
+  
+  list(results = out, y_final = y_curr)
+}
 
