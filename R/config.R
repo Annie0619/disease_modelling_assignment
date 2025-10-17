@@ -17,8 +17,8 @@ sexes <- c("F","M")
 latent_period_years     <- 14/365
 infectious_period_years <-  7/365
 VE   <- 0.95
-beta <- 4.0   # placeholder
-rho  <- 0.2   # placeholder
+beta <- 7.5*(1/infectious_period_years)   # from literature
+rho  <- 0.01   # from literature
 
 # CRS risks and trimester weights (can vary in sensitivity)
 crs_parms   <- list(r1 = 0.90, r2 = 0.25, r3 = 0.01)

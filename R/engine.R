@@ -1,27 +1,12 @@
----
-title: "Model Engine (Core Functions)"
-author: "Andomei Smit: SMTAND051"
-date: "30/09/2025"
-output:
-  bookdown::pdf_document2:
-    toc: true
-    toc_depth: 2
-    fig_caption: true
-    keep_tex: true
----
-
-
-```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+## ----setup, include=FALSE, warning=FALSE, message=FALSE----
 # ---- setup ----
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 library(readr); library(dplyr); library(tidyr); library(stringr); library(deSolve); library(tibble)
 set.seed(42)
 verbose <- TRUE
-```
 
-# Single wrapper to build model
 
-```{r}
+## ----------------------------------------------
 # ---- build_model ---------------------------------------------------------
 # Creates a self-contained model object ("mdl") that holds:
 # - structure (ages, sexes, sizes, index map)
@@ -104,11 +89,9 @@ build_model <- function(ages, sexes, pop_sy, mu_tbl, births_df, coverage_df, pre
     pop0_vec = pop0_vec
   )
 }
-```
 
-## Build initial state from model
 
-```{r}
+## ----------------------------------------------
 # ---- build_initial_state -------------------------------------------------
 # Builds y0 using mdl’s structure. Seeds 1 infection per cell (if pop>0).
 build_initial_state <- function(mdl, seed_I_per_cell = 1L) {
@@ -120,45 +103,65 @@ build_initial_state <- function(mdl, seed_I_per_cell = 1L) {
     y0
   })
 }
-```
 
-```{r}
+
+## ----------------------------------------------
 # ---- seir_ode_mdl -------------------------------------------------------
 # ODE uses:
 #   - year-specific mu via pr$mu_vec
 #   - structure & indices via pr$mdl
 seir_ode_mdl <- function(t, y, pr) {
+  if (is.null(pr$mdl)) stop("seir_ode_mdl: parms$mdl is NULL")
+  if (is.null(pr$mu_vec)) stop("seir_ode_mdl: parms$mu_vec is NULL")
   mdl <- pr$mdl
+  
   with(mdl, {
     S <- y[idx$S]; E <- y[idx$E]; I <- y[idx$I]; R <- y[idx$R]
-    N_tot <- sum(S + E + I + R); I_tot <- sum(I)
-    lambda <- if (N_tot > 0) pr$beta * (I_tot / N_tot) else 0
-
+    
+    # Hard guards: fail fast if any non-finite values appear
+    if (!all(is.finite(S))) stop("seir_ode_mdl: non-finite values in S")
+    if (!all(is.finite(E))) stop("seir_ode_mdl: non-finite values in E")
+    if (!all(is.finite(I))) stop("seir_ode_mdl: non-finite values in I")
+    if (!all(is.finite(R))) stop("seir_ode_mdl: non-finite values in R")
+    
+    N_tot <- sum(S + E + I + R)
+    I_tot <- sum(I)
+    if (!is.finite(N_tot)) stop("seir_ode_mdl: N_tot is non-finite")
+    
+    # Tiny importation floor allowed via pr$eps (default 0)
+    eps <- if (!is.null(pr$eps) && is.finite(pr$eps)) pr$eps else 0
+    lam_core <- if (N_tot > 0) pr$beta * (I_tot / N_tot) else 0
+    if (!is.finite(lam_core)) stop("seir_ode_mdl: lambda core is non-finite")
+    lambda <- lam_core + eps
+    
     dS <- -lambda * S
     dE <-  lambda * S - pr$sigma * E
     dI <-  pr$sigma * E - pr$gamma * I
     dR <-  pr$gamma * I
-
+    
     mu_here <- pr$mu_vec
-    if (length(mu_here) != length(S)) stop("mu_vec length mismatch inside ODE")
-
+    if (length(mu_here) != length(S)) {
+      stop(sprintf("seir_ode_mdl: mu_vec length mismatch: got %d, need %d",
+                   length(mu_here), length(S)))
+    }
+    if (!all(is.finite(mu_here))) stop("seir_ode_mdl: non-finite mortality hazard")
+    
     dS <- dS - mu_here * S
     dE <- dE - mu_here * E
     dI <- dI - mu_here * I
     dR <- dR - mu_here * R
-
-    S_F   <- S[female_block_indices]
-    dC_F  <- lambda * S_F
+    
+    S_F    <- S[female_block_indices]
+    dC_F   <- lambda * S_F
     dC_tot <- lambda * sum(S)
-
+    
     list(c(dS, dE, dI, dR, dC_F, dC_tot))
   })
 }
-```
 
-## Events rewritten to mdl
 
-```{r}
+
+## ----------------------------------------------
 # ---- events_mdl ----------------------------------------------------------
 apply_births_mdl <- function(y, yr, mdl, births_tbl, share_F, share_M) {
   B <- births_tbl |> dplyr::filter(year == yr) |> dplyr::pull(births_total)
@@ -214,11 +217,9 @@ apply_catchup_mdl <- function(y, yr, mdl, cov_tbl, VE) {
   }
   y
 }
-```
 
-## One-year simulator that uses mdl
 
-```{r}
+## ----------------------------------------------
 # ---- simulate_one_year_mdl ----------------------------------------------
 simulate_one_year_mdl <- function(y_start, year_int, pr, mdl, share_F, share_M) {
   # add year-specific mortality & the model object into parms
@@ -235,29 +236,25 @@ simulate_one_year_mdl <- function(y_start, year_int, pr, mdl, share_F, share_M) 
 
   # events
   y_ev <- y_end
-  y_ev <- apply_births_mdl (y_ev, year_int, mdl, mdl$births_df, share_F, share_M)
   y_ev <- apply_ageing_mdl  (y_ev, mdl)
+  y_ev <- apply_births_mdl (y_ev, year_int, mdl, mdl$births_df, share_F, share_M)
   y_ev <- apply_routine_mdl (y_ev, year_int, mdl, mdl$coverage_df, pr$VE)
   y_ev <- apply_catchup_mdl (y_ev, year_int, mdl, mdl$coverage_df, pr$VE)
 
   list(trajectory = sol, y_next = y_ev)
 }
-```
 
-## CRS helpers
 
-```{r}
+## ----------------------------------------------
 # ---- crs_from_infections_mdl --------------------------------------------
 crs_from_infections_mdl <- function(inf_F_by_age, mdl, r, w) {
   stopifnot(length(inf_F_by_age) == mdl$n_age)
   r_eff <- r$r1 * w["w1"] + r$r2 * w["w2"] + r$r3 * w["w3"]
   sum(inf_F_by_age * mdl$preg_prev_vec * r_eff)
 }
-```
 
-## Multi-year runner
 
-```{r}
+## ----------------------------------------------
 # ---- run_horizon_mdl -----------------------------------------------------
 run_horizon_mdl <- function(y_start, start_year, n_years, pr, mdl, share_F, share_M, crs_parms, tri_weights) {
   yrs <- seq.int(from = start_year, length.out = n_years)
@@ -290,11 +287,9 @@ run_horizon_mdl <- function(y_start, start_year, n_years, pr, mdl, share_F, shar
   }
   list(results = out, y_final = y_curr)
 }
-```
 
-## Burn-in
 
-```{r}
+## ----------------------------------------------
 # ---- burn_in_mdl ---------------------------------------------------------
 make_stationary_births <- function(births_base_tbl, years, ref_year) {
   B_ref <- births_base_tbl |> dplyr::filter(year == ref_year) |> dplyr::pull(births_total)
@@ -306,43 +301,68 @@ make_zero_coverage <- function(years) {
   tibble::tibble(year = years, routine_coverage = 0, catchup_coverage = NA_real_)
 }
 
-simulate_one_year_custom_mdl <- function(y_start, year_int, pr, mdl, coverage_tbl, share_F, share_M, births_tbl, mu_year_override = NULL) {
+# Replacement-births variant: births = continuous deaths to keep N ~ constant
+simulate_one_year_custom_mdl <- function(
+    y_start, year_int, pr, mdl,
+    coverage_tbl, births_tbl,
+    share_F, share_M,
+    mu_year_override = NULL,
+    replacement_births = FALSE      # <— new flag
+) {
   mu_year <- if (!is.null(mu_year_override)) mu_year_override else mdl$mu_lookup[[as.character(year_int)]]
   if (is.null(mu_year)) stop("No mortality vector for year ", year_int)
   pr_year <- pr; pr_year$mu_vec <- mu_year; pr_year$mdl <- mdl
-
+  
+  # integrate one calendar year
   times <- seq(year_int, year_int + 1, by = 1/365)
   sol <- deSolve::ode(y = y_start, times = times, func = seir_ode_mdl, parms = pr_year, method = "rk4")
-
+  
+  # end-of-year state (pre events)
   y_end <- as.numeric(sol[nrow(sol), -1])
-
+  
+  # compute births to add
+  if (replacement_births) {
+    N_start <- sum(y_start[mdl$idx$S] + y_start[mdl$idx$E] + y_start[mdl$idx$I] + y_start[mdl$idx$R])
+    N_end   <- sum(y_end  [mdl$idx$S] + y_end  [mdl$idx$E] + y_end  [mdl$idx$I] + y_end  [mdl$idx$R])
+    B_here  <- max(0, N_start - N_end)  # replace continuous deaths; never negative
+    births_tbl_here <- tibble::tibble(year = year_int, births_total = B_here)
+  } else {
+    births_tbl_here <- births_tbl
+  }
+  
+  # apply discrete events
   y_ev <- y_end
-  y_ev <- apply_births_mdl (y_ev, year_int, mdl, births_tbl, share_F, share_M)
   y_ev <- apply_ageing_mdl  (y_ev, mdl)
+  y_ev <- apply_births_mdl (y_ev, year_int, mdl, births_tbl_here, share_F, share_M)
   y_ev <- apply_routine_mdl (y_ev, year_int, mdl, coverage_tbl, pr$VE)
   y_ev <- apply_catchup_mdl (y_ev, year_int, mdl, coverage_tbl, pr$VE)
-
+  
   list(trajectory = sol, y_next = y_ev)
 }
 
-burn_in_mdl <- function(y_start, start_year, K, pr, mdl, ref_year) {
-  if (K <= 0) return(y_start)
-  yrs_burn   <- seq.int(from = start_year - K, length.out = K)
-  cov_zero   <- make_zero_coverage(yrs_burn)
-  births_stat <- make_stationary_births(mdl$births_df, yrs_burn, ref_year = ref_year)
-  mu_ref     <- mdl$mu_lookup[[as.character(ref_year)]]
-  if (is.null(mu_ref)) stop("No mortality for ref_year ", ref_year)
 
+burn_in_mdl <- function(y_start, start_year, K, pr, mdl, ref_year, share_F, share_M) {
+  if (K <= 0) return(y_start)
+  yrs_burn    <- seq.int(from = start_year - K, length.out = K)
+  cov_zero    <- make_zero_coverage(yrs_burn)
+  births_stat <- make_stationary_births(mdl$births_df, yrs_burn, ref_year = ref_year)
+  mu_ref      <- mdl$mu_lookup[[as.character(ref_year)]]
+  if (is.null(mu_ref)) stop("No mortality for ref_year ", ref_year)
+  
   y <- y_start
   for (yr in yrs_burn) {
     y[mdl$idx$C_F] <- 0; y[mdl$idx$C_tot] <- 0
-    res <- simulate_one_year_custom_mdl(y, yr, pr, mdl, cov_zero, births_stat,
-      share_F = share_F,                # <— pass through
-      share_M = share_M, 
-      mu_year_override = mu_ref)
+    res <- simulate_one_year_custom_mdl(
+      y_start  = y, year_int = yr, pr = pr, mdl = mdl,
+      coverage_tbl = cov_zero,
+      births_tbl   = births_stat,
+      share_F = share_F, share_M = share_M,
+      mu_year_override = mu_ref,
+      replacement_births = TRUE     # <— keep N ~ constant during burn-in
+    )
     y <- res$y_next
   }
   y
 }
-```
+
 
