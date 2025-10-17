@@ -1,0 +1,413 @@
+---
+title: "Main Analysis"
+author: "Andomei Smit: SMTAND051"
+date: "30/09/2025"
+output:
+  bookdown::pdf_document2:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+    keep_tex: true
+---
+
+# Setup
+
+```{r}
+# ---- setup: packages & knitr ----
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(readr); library(dplyr); library(tidyr); library(stringr); library(tibble)
+library(deSolve)
+library(knitr)
+
+# ---- load config knobs ----
+source("R/config.R")
+# ---- load the engine functions (purl'ed script) ----
+source("R/engine.R")
+```
+
+# Load data
+
+```{r}
+# ---- data: load processed inputs ----
+proc_dir <- "data/processed"
+
+# Population at start_year (sex, age, pop)
+pop_sy <- readr::read_csv(file.path(proc_dir, "pop_age_sex.csv"), show_col_types = FALSE) |>
+  dplyr::filter(year == start_year) |>
+  dplyr::select(sex, age, pop)
+
+# Mortality for the whole simulation window (year, sex, age, mu)
+sim_years <- start_year:(start_year + horizon_years - 1)
+mu_tbl <- readr::read_csv(file.path(proc_dir, "mortality_singleyear.csv"), show_col_types = FALSE) |>
+  dplyr::filter(year %in% sim_years) |>
+  dplyr::select(year, sex, age, mu)
+
+# Births, coverage, pregnancy prevalence
+births_df   <- readr::read_csv(file.path(proc_dir, "births.csv"), show_col_types = FALSE)
+coverage_df <- readr::read_csv(file.path(proc_dir, "coverage.csv"), show_col_types = FALSE)
+preg_prev   <- readr::read_csv(file.path(proc_dir, "pregnancy_prevalence.csv"), show_col_types = FALSE)
+
+# ---- guardrails: inputs must cover sim years & plausible ranges ----
+stopifnot(all(sim_years %in% unique(mu_tbl$year)))
+stopifnot(all(sim_years %in% unique(births_df$year)))
+stopifnot(all(sim_years %in% unique(coverage_df$year)))
+stopifnot(all(preg_prev$age >= 15 & preg_prev$age <= 44))
+```
+
+# Quick smoke test
+
+```{r}
+# ---- build model object ----
+mdl <- build_model(
+  ages        = ages,
+  sexes       = sexes,
+  pop_sy      = pop_sy,
+  mu_tbl      = mu_tbl,
+  births_df   = births_df,
+  coverage_df = coverage_df,
+  preg_prev   = preg_prev
+)
+
+# ---- initial state (seeds 1 infection per (sex,age) cell) ----
+y0 <- build_initial_state(mdl, seed_I_per_cell = 1L)
+
+# ---- parameters (placeholders; beta & rho will be fitted later) ----
+parms <- list(
+  sigma = 1 / latent_period_years,
+  gamma = 1 / infectious_period_years,
+  beta  = beta,   # from config.R (placeholder)
+  rho   = rho,    # from config.R (placeholder)
+  VE    = VE
+)
+
+# ---- tiny smoke test: 2 years to verify ODE + events + μ-by-year ----
+smoke <- run_horizon_mdl(
+  y_start     = y0,
+  start_year  = start_year,
+  n_years     = 2,
+  pr          = parms,
+  mdl         = mdl,
+  share_F     = share_F,
+  share_M     = share_M,
+  crs_parms   = crs_parms,
+  tri_weights = tri_weights
+)
+
+smoke$results
+```
+
+# Burn-in
+
+We want the model to start at a plausible endemic state, thus we simulate the model for K years prior to the window of the analysis for it to reach equilibrium.
+
+```{r}
+# ---- burn-in config knobs ----
+burn_in_years <- 30          # set 0 to skip burn-in entirely
+burn_ref_year <- start_year  # reuse demography from this year during burn-in
+
+# Target R0 during burn-in (plausible pre-vax rubella 5–8). Converted to beta via beta = R0 * gamma.
+R0_burnin <- 8
+```
+
+```{r}
+# ---- burn-in run  ----
+# Build a parameter list used ONLY during burn-in. We swap in beta to match R0_burnin.
+parms_pre <- list(
+  sigma = 1 / latent_period_years,
+  gamma = 1 / infectious_period_years,
+  beta  = R0_burnin * (1 / infectious_period_years),  # beta = R0 * gamma
+  rho   = rho,   # unused in burn-in; harmless placeholder
+  VE    = VE,     # unused in burn-in (no vaccination); harmless placeholder
+  eps = 1e-8
+)
+
+# Either do burn-in (K > 0) or just pass through y0
+if (burn_in_years > 0) {
+  message("Burn-in: K=", burn_in_years, " years; R0=", R0_burnin,
+          " (beta=", round(parms_pre$beta, 3), "); stationary demography from ", burn_ref_year)
+  y_start_policy <- burn_in_mdl(
+    y_start   = y0,
+    start_year = start_year,
+    K          = burn_in_years,
+    pr         = parms_pre,
+    mdl        = mdl,
+    ref_year   = burn_ref_year,
+    share_F    = share_F,
+    share_M    = share_M
+  )
+} else {
+  message("Burn-in skipped; using y0 directly.")
+  y_start_policy <- y0
+}
+```
+```{r}
+# ---- post-burn-in smoke test ----
+# Policy parameters (still placeholders; we'll fit beta & rho in Step 3)
+parms_policy <- list(
+  sigma = 1 / latent_period_years,
+  gamma = 1 / infectious_period_years,
+  beta  = beta,
+  rho   = rho,
+  VE    = VE
+)
+
+smoke_after_burnin <- run_horizon_mdl(
+  y_start     = y_start_policy,
+  start_year  = start_year,
+  n_years     = 2,              # just a short check
+  pr          = parms_policy,
+  mdl         = mdl,
+  share_F     = share_F,
+  share_M     = share_M,
+  crs_parms   = crs_parms,
+  tri_weights = tri_weights
+)
+
+smoke_after_burnin$results
+```
+```{r}
+# ---- optional diagnostics ----
+cat("Policy R0 ≈ ", round(parms_policy$beta / parms_policy$gamma, 3), "\n")
+
+N0 <- sum(y_start_policy[mdl$idx$S] + y_start_policy[mdl$idx$E] +
+          y_start_policy[mdl$idx$I] + y_start_policy[mdl$idx$R])
+cat("Total population at policy start: ", format(N0, big.mark=","), "\n")
+
+I0 <- sum(y_start_policy[mdl$idx$I])
+cat("Infectious at policy start (sum over all ages/sexes): ", round(I0), "\n")
+```
+
+```{r}
+# Inspect infectious prevalence after burn-in with more precision
+I0      <- sum(y_start_policy[mdl$idx$I])
+N0      <- sum(y_start_policy[mdl$idx$S] + y_start_policy[mdl$idx$E] +
+               y_start_policy[mdl$idx$I] + y_start_policy[mdl$idx$R])
+prev_I0 <- I0 / N0
+
+cat(sprintf("I0 (exact) = %.6f\n", I0))
+cat(sprintf("N0 (exact) = %.0f\n", N0))
+cat(sprintf("Prev_I0 = %.8f (%.3f per 100k)\n", prev_I0, prev_I0*1e5))
+
+```
+
+# Test the R0 and rho values found in literature
+
+```{r}
+# ---- Literature-based priors (you can tweak) ----
+R0_lit_central <- 7.5        # SA-specific anchor (use 6–8 in sensitivity)
+rho_lit_central <- 0.005      # 1% reporting; try 0.005–0.02 in sensitivity
+
+# Derived transmission rate (beta = R0 * gamma)
+parms_locked <- list(
+  sigma = 1 / latent_period_years,
+  gamma = 1 / infectious_period_years,
+  beta  = R0_lit_central * (1 / infectious_period_years),
+  rho   = rho_lit_central,
+  VE    = VE,
+  eps   = 1e-8               # tiny importation floor (keeps low-level circulation)
+)
+
+# Optional: brief burn-in to reach endemic state consistent with locked R0
+burn_in_years_locked <- 20
+y_start_locked <- burn_in_mdl(
+  y_start    = y0,
+  start_year = start_year,
+  K          = burn_in_years_locked,
+  pr         = parms_locked,
+  mdl        = mdl,
+  ref_year   = start_year,
+  share_F    = share_F,
+  share_M    = share_M
+)
+
+# ---- Baseline run (no special catch-up beyond what's in coverage_df) ----
+baseline_locked <- run_horizon_mdl(
+  y_start     = y_start_locked,
+  start_year  = start_year,
+  n_years     = horizon_years,
+  pr          = parms_locked,
+  mdl         = mdl,
+  share_F     = share_F,
+  share_M     = share_M,
+  crs_parms   = crs_parms,
+  tri_weights = tri_weights
+)
+
+baseline_locked$results
+
+
+# ---- Expected reported cases for a fixed beta & rho over 2012–2019 ----
+fit_years <- 2012:2019
+fit_ref_demog <- start_year        # use stationary demography at start_year
+
+expected_reported_for_locked <- function(beta_val, rho_val,
+                                         fit_years, mdl, share_F, share_M,
+                                         ref_year, burnin_years = 20,
+                                         latent_period_years, infectious_period_years) {
+  pr_here <- list(
+    sigma = 1 / latent_period_years,
+    gamma = 1 / infectious_period_years,
+    beta  = beta_val,
+    rho   = rho_val,
+    VE    = VE,
+    eps   = 1e-8
+  )
+  # burn-in ending before first fit year
+  y_burn <- burn_in_mdl(
+    y_start    = y0,
+    start_year = min(fit_years),
+    K          = burnin_years,
+    pr         = pr_here,
+    mdl        = mdl,
+    ref_year   = ref_year,
+    share_F    = share_F,
+    share_M    = share_M
+  )
+  # simulate fit years (no vax; stationary demography)
+  sim <- run_stationary_novax(
+    y_start = y_burn,
+    years   = fit_years,
+    pr      = pr_here,
+    mdl     = mdl,
+    ref_year = ref_year,
+    share_F = share_F,
+    share_M = share_M
+  )
+  sim$results |>
+    dplyr::mutate(mu = rho_val * infections_total) |>
+    dplyr::select(year, mu)
+}
+
+# Build comparison table and a simple plot
+exp_locked <- expected_reported_for_locked(
+  beta_val = parms_locked$beta,
+  rho_val  = parms_locked$rho,
+  fit_years = fit_years,
+  mdl = mdl, share_F = share_F, share_M = share_M,
+  ref_year = fit_ref_demog,
+  latent_period_years = latent_period_years,
+  infectious_period_years = infectious_period_years
+)
+
+fit_compare_locked <- cases_fit |>
+  dplyr::filter(year %in% fit_years) |>
+  dplyr::inner_join(exp_locked, by = "year") |>
+  dplyr::rename(obs = cases_reported_total, pred = mu)
+
+print(fit_compare_locked)
+
+plot(fit_compare_locked$year, fit_compare_locked$obs, type = "b", pch = 16,
+     xlab = "Year", ylab = "Reported cases",
+     main = "Observed vs expected (locked R0, rho; stationary demography)")
+lines(fit_compare_locked$year, fit_compare_locked$pred, type = "b", pch = 1, lty = 2)
+legend("topright", legend = c("Observed", "Expected"), pch = c(16,1), lty = c(1,2))
+```
+
+
+# Add diagnostics for mean age of infection
+
+```{r}
+# ---------------------------------------------
+# Helper: mean age at infection among females 15–44
+# Inputs:
+#   C_F_vec : numeric vector of length mdl$n_age; infections in females by single-year age
+#   mdl     : model object (to access 'ages')
+# Returns:
+#   Weighted mean age over ages 15..44, or NA if no infections in that range
+mean_age_infection_f1544 <- function(C_F_vec, mdl) {
+  stopifnot(length(C_F_vec) == mdl$n_age)
+  a <- mdl$ages
+  sel <- (a >= 15 & a <= 44)
+  w <- C_F_vec[sel]
+  if (sum(w) <= 0) return(NA_real_)
+  sum(a[sel] * w) / sum(w)
+}
+
+# ---------------------------------------------
+# Runner that adds "paradox" diagnostics
+# Mirrors run_horizon_mdl, but also records:
+#   - inf_F1544        : infections in females aged 15–44 (per year)
+#   - mean_age_F1544   : mean age of infection in females 15–44 (per year)
+#
+# Note: We reuse the same ODE + events; we only add post-processing.
+run_horizon_with_paradox <- function(y_start, start_year, n_years, pr, mdl, share_F, share_M, crs_parms, tri_weights) {
+  yrs <- seq.int(from = start_year, length.out = n_years)
+  out <- tibble::tibble(
+    year = integer(),
+    infections_total = double(),
+    reported_cases   = double(),
+    crs              = double(),
+    inf_F1544        = double(),
+    mean_age_F1544   = double()
+  )
+
+  y_curr <- y_start
+
+  for (yr in yrs) {
+    # Reset yearly counters (accumulators) before integrating the year
+    y_curr[mdl$idx$C_F]  <- 0
+    y_curr[mdl$idx$C_tot] <- 0
+
+    # Integrate ODE over the calendar year and apply events
+    res   <- simulate_one_year_mdl(y_curr, yr, pr, mdl, share_F, share_M)
+
+    # Read end-of-year accumulators BEFORE events are applied
+    y_pre <- as.numeric(res$trajectory[nrow(res$trajectory), -1])
+    C_F_end   <- y_pre[mdl$idx$C_F]           # female infections by age
+    C_tot_end <- as.numeric(y_pre[mdl$idx$C_tot])
+
+    # Compute CRS using your existing helper
+    crs_year <- crs_from_infections_mdl(C_F_end, mdl, r = crs_parms, w = tri_weights)
+
+    # Compute paradox diagnostics
+    a <- mdl$ages
+    sel <- (a >= 15 & a <= 44)
+    inf_F1544      <- sum(C_F_end[sel])
+    mean_age_F1544 <- mean_age_infection_f1544(C_F_end, mdl)
+
+    out <- dplyr::bind_rows(out, tibble::tibble(
+      year = yr,
+      infections_total = C_tot_end,
+      reported_cases   = if (!is.null(pr$rho) && is.finite(pr$rho)) pr$rho * C_tot_end else NA_real_,
+      crs              = crs_year,
+      inf_F1544        = inf_F1544,
+      mean_age_F1544   = mean_age_F1544
+    ))
+
+    # Roll state forward (post-events state becomes next year's start)
+    y_curr <- res$y_next
+  }
+
+  list(results = out, y_final = y_curr)
+}
+```
+
+# Policy Scenario Testing
+
+```{r}
+# ---------------------------------------------
+# Build a coverage table for a scenario
+# Inputs:
+#   years        : integer vector (e.g., start_year:(start_year + horizon_years - 1))
+#   p_routine    : routine coverage in [0,1], applied to every year
+#   campaign_year: integer year for one-time catch-up (or NULL for none)
+#   p_catchup    : catch-up coverage in [0,1] (ignored if campaign_year is NULL)
+# Returns:
+#   data.frame with cols: year, routine_coverage, catchup_coverage
+make_coverage_scenario <- function(years, p_routine, campaign_year = NULL, p_catchup = NULL) {
+  stopifnot(p_routine >= 0, p_routine <= 1)
+  cov <- tibble::tibble(
+    year = years,
+    routine_coverage = p_routine,
+    catchup_coverage = NA_real_
+  )
+  if (!is.null(campaign_year)) {
+    stopifnot(campaign_year %in% years)
+    stopifnot(!is.null(p_catchup), p_catchup >= 0, p_catchup <= 1)
+    cov$catchup_coverage[cov$year == campaign_year] <- p_catchup
+  }
+  cov
+}
+```
+
+
