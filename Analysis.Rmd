@@ -16,7 +16,7 @@ output:
 # ---- setup: packages & knitr ----
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 library(readr); library(dplyr); library(tidyr); library(stringr); library(tibble)
-library(deSolve)
+library(deSolve); library(ggplot2); library(scales)
 library(knitr)
 
 # ---- load config knobs ----
@@ -284,6 +284,140 @@ legend("topright", legend = c("Observed", "Expected (scaled rho)"),
 legend("topright", legend = c("Expected (scaled rho)"), pch = 0, lty = 3, bty = "n")
 
 ```
+
+```{r}
+# ---- validation: tidy data + publication-ready plots (saves to outputs/) ----
+# Creates two figures:
+#  1) Observed, Expected (literature rho), Expected (scaled rho_hat) on one panel
+#  2) Observed vs Expected (scaled rho_hat) only — cleaner view when lit line is far off
+# Also writes a CSV snapshot of the plotted time series.
+
+# Ensure outputs dir exists
+out_dir <- "outputs"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# Build a tidy table for plotting & export
+# Join obs, expected (literature rho), and expected (scaled rho_hat)
+val_tbl <- fit_compare_locked %>%
+  dplyr::left_join(
+    fit_compare_scaled %>% dplyr::select(year, exp_scaled),
+    by = "year"
+  ) %>%
+  dplyr::arrange(year)
+
+# Long format for plotting; keep a key for mapping labels
+val_long <- val_tbl %>%
+  tidyr::pivot_longer(
+    cols = c(obs, exp_locked, exp_scaled),
+    names_to = "series_key",
+    values_to = "value"
+  ) %>%
+  dplyr::mutate(
+    series_key = factor(series_key, levels = c("obs","exp_locked","exp_scaled"))
+  )
+
+# Legend labels:
+#  - Both are estimates of rho; one is literature-based (\hat{rho}_{lit}), the other is scaled (\hat{rho}_{scaled})
+lab_obs <- "Observed"
+lab_lit <- expression("Expected (" * hat(rho)[lit] * ")")
+lab_scl <- expression("Expected (" * hat(rho)[scaled] * ")")
+
+# Common style (bigger text, cleaner theme)
+base_size <- 16
+legend_text_size <- 14
+axis_text_size <- 14
+line_size <- 1.05
+point_size <- 2.8
+
+# Helper: y-axis as thousands with a label
+scale_y_thousands <- scale_y_continuous(
+  name   = "Reported cases (thousands)",
+  labels = function(x) scales::comma(x / 1000)
+)
+
+# ---------- Figure 1: Observed, Expected(\hat{rho}_{lit}), Expected(\hat{rho}_{scaled})
+p_all <- ggplot(val_long, aes(x = year, y = value)) +
+  geom_line(aes(linetype = series_key), linewidth = line_size) +
+  geom_point(
+    data = dplyr::filter(val_long, series_key == "obs"),
+    size = point_size
+  ) +
+  scale_linetype_manual(
+    name   = NULL,
+    values = c("obs" = "solid", "exp_locked" = "dashed", "exp_scaled" = "dotdash"),
+    breaks = c("obs","exp_locked","exp_scaled"),
+    labels = list(lab_obs, lab_lit, lab_scl)
+  ) +
+  scale_y_thousands +
+  labs(
+    title = "Observed vs expected reported cases",
+    subtitle = "Stationary demography; no vaccination in fit window",
+    x = "Year"
+  ) +
+  theme_bw(base_size = base_size) +
+  theme(
+    legend.position = "right",
+    legend.justification = "top",
+    plot.margin = margin(10, 20, 10, 10),
+    legend.text = element_text(size = legend_text_size),
+    axis.text  = element_text(size = axis_text_size),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  ) +
+  guides(linetype = guide_legend(override.aes = list(linewidth = 1.3)))
+
+ggsave("plots/validation_obs_expected_all.png",
+       plot = p_all, width = 8, height = 5, dpi = 400)
+
+# ---------- Figure 2: Observed vs Expected(\hat{rho}_{scaled}) only (cleaner)
+val_long_scaled <- dplyr::filter(val_long, series_key %in% c("obs","exp_scaled"))
+
+p_scaled <- ggplot(val_long_scaled, aes(x = year, y = value)) +
+  geom_line(aes(linetype = series_key), linewidth = line_size) +
+  geom_point(
+    data = dplyr::filter(val_long_scaled, series_key == "obs"),
+    size = point_size
+  ) +
+  scale_linetype_manual(
+    name   = NULL,
+    values = c("obs" = "solid", "exp_scaled" = "dotdash"),
+    breaks = c("obs","exp_scaled"),
+    labels = list(lab_obs, lab_scl)
+  ) +
+  scale_y_thousands +
+  labs(
+    title = "Observed vs expected",
+    subtitle = expression(paste("Both use ", hat(rho), "; curve shows ", hat(rho)[scaled], " (mean-level rescale)")),
+    x = "Year"
+  ) +
+  theme_bw(base_size = base_size) +
+  theme(
+    legend.position = "right",
+    legend.justification = "top",
+    plot.margin = margin(10, 20, 10, 10),
+    legend.text = element_text(size = legend_text_size),
+    axis.text  = element_text(size = axis_text_size),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  ) +
+  guides(linetype = guide_legend(override.aes = list(linewidth = 1.3)))
+
+ggsave("plots/validation_obs_expected_scaled.png",
+       plot = p_scaled, width = 8, height = 5, dpi = 400)
+
+
+# ---------------------------
+# Export the numbers used in the plot(s)
+# ---------------------------
+readr::write_csv(val_tbl, file.path(out_dir, "validation_series_table.csv"))
+
+# Console message
+message("Saved: ",
+        file.path(out_dir, "validation_obs_expected_all.png"), " ; ",
+        file.path(out_dir, "validation_obs_expected_scaled.png"), " ; ",
+        file.path(out_dir, "validation_series_table.csv"))
+```
+
 
 # Add diagnostics for mean age of infection
 
@@ -616,247 +750,697 @@ scenario_summary <- dplyr::bind_rows(lapply(scenario_results, `[[`, "summary")) 
 How much better is this than baseline.
 
 ```{r}
-# ---- CRS averted vs baseline (baseline = Routine 80% + no catch-up) ----
-# Select baseline row dynamically (in case labels/ids change)
-# Choose which horizon to compare
-metric <- "CRS10"   # or "CRS25"
+# ---- Baseline-locked averted metrics (baseline = r80_none only) ----------
+# 1) Find r80_none baseline row
+base80 <- scenario_summary %>%
+  filter(is.na(catch_year), abs(routine - 0.80) < 1e-9) %>%
+  slice(1)
+stopifnot(nrow(base80) == 1)
 
-baseline_row <- scenario_summary %>%
-  dplyr::filter(is.na(catch_year), abs(routine - 0.80) < 1e-9) %>%
-  dplyr::slice(1)
-
-stopifnot(nrow(baseline_row) == 1)
-base_val <- baseline_row[[metric]]
-
+# 2) Add baseline-locked columns
 scenario_summary <- scenario_summary %>%
-  dplyr::mutate(
-    Averted = base_val - .data[[metric]]
-  ) %>%
-  dplyr::arrange(dplyr::desc(Averted))
+  mutate(
+    Averted10_base80 = base80$CRS10 - CRS10,
+    Averted25_base80 = base80$CRS25 - CRS25,
+    # For backward compatibility in existing code:
+    Averted = Averted10_base80
+  )
+
+# 3) Save a clean copy for the report
+readr::write_csv(scenario_summary, "outputs/scenario_summary.csv")
+message("Saved: outputs/scenario_summary.csv")
 ```
+
+## Some plots
+
+```{r}
+# ---- SCENARIOS: helpers for plotting ----
+
+# Get timeseries df for a scenario id (adds 'id' and 'label')
+get_ts <- function(id) {
+  stopifnot(id %in% names(scenario_results))
+  df <- scenario_results[[id]]$timeseries
+  lab <- scenario_summary$label[match(id, scenario_summary$id)]
+  df$id <- id
+  df$label <- ifelse(is.na(lab), id, lab)
+  df
+}
+
+# Common y-scale in thousands
+scale_y_thousands <- scale_y_continuous(
+  name = "CRS (thousands)",
+  labels = function(x) scales::comma(x/1000)
+)
+
+# Save convenience
+save_plot <- function(p, path, w = 10, h = 5, dpi = 400) {
+  ggplot2::ggsave(path, plot = p, width = w, height = h, dpi = dpi)
+  message("Saved: ", path)
+}
+```
+
+## Compare baseline to increase routine to 90%
+
+```{r}
+# ---- SCENARIOS: CRS time-series (key scenarios) ----
+ids_focus <- c("r80_none", "r90_none")
+ids_focus <- ids_focus[ids_focus %in% names(scenario_results)]  # guard
+
+ts_focus <- dplyr::bind_rows(lapply(ids_focus, get_ts))
+
+# Order legend by 10-year averted vs r80_none (descending)
+ord <- scenario_summary %>%
+  dplyr::filter(id %in% ids_focus) %>%
+  dplyr::arrange(dplyr::desc(Averted10_base80))
+
+ts_focus$label <- factor(ts_focus$label, levels = ord$label)
+
+
+p_ts <- ggplot(ts_focus, aes(x = year, y = crs, color = label)) +
+  geom_line(linewidth = 1.05) +
+  scale_y_thousands +
+  labs(
+    title = "CRS over time: selected scenarios",
+    x = "Year", color = NULL
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+save_plot(p_ts, "plots/scenario_crs_r90_none_r80_none.png")
+```
+
+
+## Compate r90_c90_now with delays
+
+Start with the whole CRS timeseries for each.
+
+```{r}
+# 1) Guard: the four scenario IDs we want
+ids_focus <- c("r90_c90_now","r90_c90_d1","r90_c90_d2","r90_c90_d3")
+ids_focus <- ids_focus[ids_focus %in% names(scenario_results)]
+stopifnot(length(ids_focus) > 0)
+
+# 2) Minimal helper to fetch timeseries & label (no external dependency)
+get_ts_local <- function(id) {
+  stopifnot(id %in% names(scenario_results))
+  df  <- scenario_results[[id]]$timeseries
+  lbl <- scenario_summary$label[match(id, scenario_summary$id)]
+  df$label <- ifelse(is.na(lbl), id, lbl)
+  df$id    <- id
+  df
+}
+
+# 3) Pull timeseries for chosen scenarios
+ts_focus <- dplyr::bind_rows(lapply(ids_focus, get_ts_local))
+
+
+# Order legend by 10-year averted vs r80_none (descending)
+ord <- scenario_summary %>%
+  dplyr::filter(id %in% ids_focus) %>%
+  dplyr::arrange(dplyr::desc(Averted10_base80))
+
+ts_focus$label <- factor(ts_focus$label, levels = ord$label)
+
+
+# 6) Local y-scale in thousands so we don't rely on a prior helper
+scale_y_thousands_local <- scale_y_continuous(
+  name   = "CRS (thousands)",
+  labels = function(x) scales::comma(x / 1000)
+)
+
+# 7) Plot
+p_ts <- ggplot(ts_focus, aes(x = year, y = crs, color = label)) +
+  geom_line(linewidth = 1.15) +
+  scale_y_thousands_local +
+  labs(
+    title = "CRS over time: routine 90% with catch-up timing",
+    subtitle = "Immediate vs delays (1–3 years) at 90% catch-up",
+    x = "Year", color = NULL
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(linewidth = 1.6)))
+
+ggsave("plots/scenario_crs_r90_delays.png", p_ts, width = 10, height = 5, dpi = 400)
+```
+
+Now just plot 2025 to 2030:
+
+```{r}
+# Focus set (guard to only keep those that exist locally)
+ids_focus <- c("r90_c90_now","r90_c90_d1","r90_c90_d2","r90_c90_d3")
+ids_focus <- ids_focus[ids_focus %in% names(scenario_results)]
+stopifnot(length(ids_focus) > 0)
+
+# Minimal helper to fetch timeseries & readable label (no external helpers assumed)
+get_ts_local <- function(id) {
+  df  <- scenario_results[[id]]$timeseries
+  lbl <- scenario_summary$label[match(id, scenario_summary$id)]
+  df$label <- ifelse(is.na(lbl), id, lbl)
+  df$id    <- id
+  df
+}
+
+# Pull timeseries, then filter to 2025–2030 inclusive
+ts_focus <- dplyr::bind_rows(lapply(ids_focus, get_ts_local)) %>%
+  dplyr::filter(year >= 2025, year <= 2030)
+
+
+# Order legend by 10-year averted vs r80_none (descending)
+ord <- scenario_summary %>%
+  dplyr::filter(id %in% ids_focus) %>%
+  dplyr::arrange(dplyr::desc(Averted10_base80))
+ts_focus$label <- factor(ts_focus$label, levels = ord$label)
+
+
+# Local y-axis in thousands
+scale_y_thousands_local <- scale_y_continuous(
+  name   = "CRS (thousands)",
+  labels = function(x) scales::comma(x / 1000)
+)
+
+# Plot (windowed years)
+p_ts_win <- ggplot(ts_focus, aes(x = year, y = crs, color = label)) +
+  geom_line(linewidth = 1.15) +
+  scale_y_thousands_local +
+  labs(
+    title = "CRS over time (2025–2030): routine 90% with catch-up timing",
+    subtitle = "Immediate vs delays (1–3 years) at 90% catch-up",
+    x = "Year", color = NULL
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 12),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(linewidth = 1.6)))
+
+ggsave("plots/scenario_crs_r90_delays_2025_2030.png", p_ts_win, width = 10, height = 5, dpi = 400)
+```
+
+## CRS averted at 10y and 25y
+
+```{r}
+# ---- SCENARIOS: bar chart of averted CRS (10y & 25y) vs r80_none --------
+# Use the baseline-locked columns already in scenario_summary
+sc_bar <- scenario_summary %>%
+  # Order by 10-year impact (descending)
+  dplyr::arrange(dplyr::desc(Averted10_base80)) %>%
+  dplyr::mutate(label = factor(label, levels = label))
+
+sc_bar_long <- sc_bar %>%
+  dplyr::select(label, Averted10_base80, Averted25_base80) %>%
+  tidyr::pivot_longer(
+    cols = c(Averted10_base80, Averted25_base80),
+    names_to = "horizon", values_to = "averted"
+  ) %>%
+  dplyr::mutate(
+    horizon = dplyr::recode(horizon,
+                            Averted10_base80 = "CRS10",
+                            Averted25_base80 = "CRS25")
+  )
+
+p_bar <- ggplot(sc_bar_long, aes(x = label, y = averted/1000, fill = horizon)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "CRS averted vs baseline (r80_none)",
+    x = NULL, y = "Averted CRS (thousands)", fill = NULL
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+save_plot(p_bar, "plots/scenario_averted_bar.png")
+```
+
+## Mean age (F15-44)
+
+```{r}
+# ---- SCENARIOS: mean age of infection in females 15–44 (key scenarios) ----
+ids_focus <- c("r90_c90_now", "r80_c90_now", "r90_c90_now_9m9y")
+ids_focus <- ids_focus[ids_focus %in% names(scenario_results)]  # guard
+
+ts_focus <- dplyr::bind_rows(lapply(ids_focus, get_ts))
+
+ts_focus_ma <- ts_focus %>%
+  dplyr::select(year, label, mean_age_F1544)
+
+p_ma <- ggplot(ts_focus_ma, aes(x = year, y = mean_age_F1544, color = label)) +
+  geom_line(linewidth = 1.05) +
+  labs(
+    title = "Mean age at infection (females 15–44)",
+    x = "Year", y = "Mean age (years)", color = NULL
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+save_plot(p_ma, "plots/scenario_mean_age_f1544.png")
+```
+
 
 # Sensitivity check
 
 ```{r}
-# ---------------------------------------------
-# Expanded sensitivity grid definitions
-# - R0: keep literature-reasonable values
-# - Routine: 50%..95% in 5% steps
-# - Catch-up: 0%..95% in 10% steps (0 means no campaign)
-# - Campaign timing: immediate (start_year) vs delayed (1, 2 and 3y)
+# ============================
+# Sensitivity grid (parallel)
+# ============================
+# Parallelizes the scenario sweep across:
+#   - R0 ∈ {6, 7, 8}
+#   - routine ∈ {50%, 55%, ..., 95%}
+#   - catch-up ∈ {0%, 10%, ..., 95%}
+#   - campaign timing ∈ {immediate, +1y, +2y, +3y} for catch-up > 0
+#
+# Design:
+#   1) Build a spec table of all combinations.
+#   2) Map each row → run model → summarize CRS10/CRS25.
+#   3) Compute averted vs baseline r80_none per R0.
+#   4) Save to outputs/.
+#
 
-# ---- sensitivity grid options (expanded) ----
-R0_vals_exp        <- c(6.0, 7.0, 8.0)
-routine_vals_exp   <- seq(0.50, 0.95, by = 0.05)
-catch_vals_exp     <- seq(0.00, 0.95, by = 0.10)  # 0 = no catch-up
-campaign_year_opts <- c(start_year, start_year + 1L, start_year + 2L, start_year + 3L)  # immediate, +1y, +2y, +3y
-```
+# ---- libraries for parallel & progress ----
+suppressPackageStartupMessages({
+  library(future.apply)   # parallel lapply
+  library(progressr)      # progress bars
+})
 
+# ---- knobs to optionally thin the grid (for fast testing) ----
+# Set to TRUE for a quick dry-run (much faster, fewer combos)
+FAST_TEST <- FALSE
 
-```{r}
-# ---------------------------------------------
-# Run the expanded grid
-# For each (R0, routine, catch-up %), evaluate:
-#   - immediate campaign at start_year
-#   - delayed campaign (start_year + 3)
-# Special case: if catch-up == 0, we only run "no campaign" (i.e., 'immediate' slot carries no campaign).
+# ---- policy years & helper for windowed CRS sums ----
+years_policy <- start_year:(start_year + horizon_years - 1)
 
-sens_rows_exp <- list()
-row_id <- 0L
+crs_sum_window <- function(df, start_year, years) {
+  # Sum CRS in [start_year, start_year + years - 1]
+  stopifnot(all(c("year","crs") %in% names(df)))
+  yr_max <- start_year + years - 1L
+  sum(df$crs[df$year >= start_year & df$year <= yr_max], na.rm = TRUE)
+}
 
-for (R0v in R0_vals_exp) {
+# ---- grid choices (thin if FAST_TEST) ----
+R0_vals      <- if (FAST_TEST) c(7.0)                else c(6.0, 7.0, 8.0)
+routine_vals <- if (FAST_TEST) c(0.80, 0.90)         else seq(0.50, 0.95, by = 0.05)
+catch_vals   <- if (FAST_TEST) c(0.00, 0.90)         else seq(0.00, 0.95, by = 0.10)
+camp_years   <- if (FAST_TEST) c(start_year, start_year + 1L) else
+                             c(start_year, start_year + 1L, start_year + 2L, start_year + 3L)
+
+# ---- build spec table -----------------------------------------------------
+# For catch-up = 0, force a single "none" campaign (campaign_year = NA).
+# For catch-up > 0, include all camp_years.
+
+spec_none <- expand.grid(
+  R0 = R0_vals,
+  routine = routine_vals,
+  catchup = 0.00,
+  campaign_year = NA_integer_,
+  KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+)
+
+spec_some <- expand.grid(
+  R0 = R0_vals,
+  routine = routine_vals,
+  catchup = setdiff(catch_vals, 0.00),
+  campaign_year = camp_years,
+  KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+)
+
+sens_spec <- dplyr::bind_rows(spec_none, spec_some) %>%
+  dplyr::mutate(
+    campaign = ifelse(is.na(campaign_year), "none", campaign_label(campaign_year, start_year))
+  )
+
+# ---- per-row runner -------------------------------------------------------
+run_one_spec <- function(row) {
+  # row: one row from sens_spec (data.frame-like, 1 row)
+  R0v   <- row[["R0"]]
+  pr    <- row[["routine"]]
+  pc    <- row[["catchup"]]
+  cy    <- row[["campaign_year"]]   # may be NA
+  camp  <- row[["campaign"]]
+
+  # Parameters for this R0 (beta = R0 * gamma)
   parms_sens <- parms_locked
   parms_sens$beta <- R0v * parms_locked$gamma
 
-  for (pr in routine_vals_exp) {
-    for (pc in catch_vals_exp) {
-
-      # Decide which campaign years to evaluate for this catch-up %
-      camp_years_this <- if (pc == 0) NA_integer_ else campaign_year_opts
-
-      for (cy in camp_years_this) {
-
-        # Build coverage table
-        cov_tbl <- make_coverage_scenario(
-          years         = years_policy,
-          p_routine     = pr,
-          campaign_year = if (is.na(cy)) NULL else cy,
-          p_catchup     = if (is.na(cy)) NULL else pc
-        )
-
-        # Apply zero-vax during delay window (generic)
-        cov_tbl <- apply_delay(cov_tbl, start_year = start_year, campaign_year = cy)
-
-        # Clone model with coverage
-        mdl_sc <- clone_with_coverage(mdl, cov_tbl)
-
-        # Run horizon
-        run_sc <- run_horizon_with_paradox(
-          y_start     = y_start_locked,
-          start_year  = start_year,
-          n_years     = horizon_years,
-          pr          = parms_sens,
-          mdl         = mdl_sc,
-          share_F     = share_F,
-          share_M     = share_M,
-          crs_parms   = crs_parms,
-          tri_weights = tri_weights
-        )
-
-        df <- run_sc$results
-
-        row_id <- row_id + 1L
-        sens_rows_exp[[row_id]] <- tibble::tibble(
-          R0          = R0v,
-          routine     = pr,
-          catchup     = pc,
-          campaign    = if (pc == 0) "none" else campaign_label(cy, start_year),
-          campaign_year = if (pc == 0) NA_integer_ else cy,
-          CRS10       = sum(df$crs, na.rm = TRUE),
-          cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
-          mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
-        )
-      }
-    }
-  }
-}
-
-sens_expanded <- dplyr::bind_rows(sens_rows_exp)
-
-# Baseline per R0 for "CRS averted" comparisons (routine 80%, no catch-up, campaign='none')
-baseline_key <- sens_expanded %>%
-  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") %>%
-  dplyr::select(R0, baseline_CRS10 = CRS10)
-
-sens_expanded2 <- sens_expanded %>%
-  dplyr::left_join(baseline_key, by = "R0") %>%
-  dplyr::mutate(CRS10_averted = baseline_CRS10 - CRS10)
-
-# Ensure campaign facet order
-campaign_levels <- c("none", "immediate", "delayed1y", "delayed2y", "delayed3y")
-sens_expanded2 <- sens_expanded2 %>%
-  dplyr::mutate(campaign = factor(campaign, levels = campaign_levels))
-```
-
-```{r}
-# Quick view: best options per R0 (top 10 by CRS averted)
-best_per_R0 <- sens_expanded2 |>
-  dplyr::group_by(R0) |>
-  dplyr::arrange(dplyr::desc(CRS10_averted), .by_group = TRUE) |>
-  dplyr::slice_head(n = 10L) |>
-  dplyr::ungroup()
-```
-
-## CRS Heatmap
-
-```{r}
-# ---------------------------------------------
-# Heatmaps of CRS averted, plus paradox markers
-library(ggplot2)
-
-# 1) CRS averted heatmap (per R0, by campaign timing)
-ggplot(sens_expanded2, aes(x = routine, y = catchup, fill = CRS10_averted)) +
-  geom_tile() +
-  facet_grid(R0 ~ campaign, labeller = label_both) +
-  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
-  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05)) +
-  scale_y_continuous("Catch-up coverage", breaks = seq(0.0, 0.95, by = 0.10)) +
-  labs(title = "CRS averted vs baseline (routine 80%, no catch-up)",
-       subtitle = "Facets by R0 and campaign timing; higher = better") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "right")
-
-# 2) Add paradox flag (TRUE if cum_inf_F1544 <= baseline at same R0)
-#    First compute the baseline cum_inf_F1544 per R0 (routine=0.80, catchup=0, campaign='none')
-baseline_infF <- sens_expanded2 |>
-  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") |>
-  dplyr::select(R0, base_infF = cum_inf_F1544)
-
-sens_plot <- sens_expanded2 |>
-  dplyr::left_join(baseline_infF, by = "R0") |>
-  dplyr::mutate(
-    paradox_ok = cum_inf_F1544 <= base_infF + 1e-9  # allow tiny numerical wiggle
+  # Coverage table for this scenario
+  cov_tbl <- make_coverage_scenario(
+    years         = years_policy,
+    p_routine     = pr,
+    campaign_year = if (is.na(cy)) NULL else cy,
+    p_catchup     = if (is.na(cy)) NULL else pc
   )
 
-# Heatmap with markers: red "✖" where paradox is violated
-ggplot(sens_plot, aes(x = routine, y = catchup, fill = CRS10_averted)) +
-  geom_tile() +
-  geom_point(data = subset(sens_plot, !paradox_ok),
-             aes(x = routine, y = catchup),
-             shape = 4, size = 2.2, stroke = 1.1, color = "red") +
-  facet_grid(R0 ~ campaign, labeller = label_both) +
-  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
-  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05)) +
-  scale_y_continuous("Catch-up coverage", breaks = seq(0.0, 0.95, by = 0.10)) +
-  labs(title = "CRS averted with paradox violations marked",
-       subtitle = "Red ✖ indicates infections in females 15–44 increased vs baseline") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "right")
+  # Delay rule: suppress catch-up before campaign; routine continues during delay
+  cov_tbl <- apply_delay(
+    cov_tbl,
+    start_year     = start_year,
+    campaign_year  = cy,
+    zero_routine   = FALSE
+  )
 
-# Optional: save to disk
-#out_dir <- "outputs"
-#if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-#ggsave(file.path(out_dir, "heatmap_CRS_averted.png"), width = 10, height = 7, dpi = 300)
-#ggsave(file.path(out_dir, "heatmap_CRS_averted_paradox.png"), width = 10, height = 7, dpi = 300)
+  # Clone model with this coverage
+  mdl_sc <- clone_with_coverage(mdl, cov_tbl)
+
+  # Run horizon with paradox diagnostics (same horizon_years as elsewhere)
+  run_sc <- run_horizon_with_paradox(
+    y_start     = y_start_locked,
+    start_year  = start_year,
+    n_years     = horizon_years,
+    pr          = parms_sens,
+    mdl         = mdl_sc,
+    share_F     = share_F,
+    share_M     = share_M,
+    crs_parms   = crs_parms,
+    tri_weights = tri_weights
+  )
+
+  df <- run_sc$results
+
+  # Summaries
+  tibble::tibble(
+    R0                 = R0v,
+    routine            = pr,
+    catchup            = pc,
+    campaign           = camp,
+    campaign_year      = if (is.na(cy)) NA_integer_ else cy,
+    CRS10              = crs_sum_window(df, start_year = start_year, years = 10),
+    CRS25              = crs_sum_window(df, start_year = start_year, years = 25),
+    cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
+    mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
+  )
+}
+
+# ---- parallel plan --------------------------------------------------------
+# Use all available cores minus one. For Windows, 'multisession' is required.
+workers <- max(1L, parallel::detectCores() - 1L)
+future::plan(future::multisession, workers = workers)
+
+# Optional: silence RNG warnings for nested parallel operations
+options(future.rng.onMisuse = "ignore")
+
+# ---- execute with progress -----------------------------------------------
+with_progress({
+  p <- progressor(steps = nrow(sens_spec))
+  sens_list <- future_lapply(
+    X = seq_len(nrow(sens_spec)),
+    FUN = function(i) {
+      # Progress tick (lightweight)
+      p()
+      run_one_spec(sens_spec[i, , drop = FALSE])
+    }
+  )
+})
+
+sens_grid <- dplyr::bind_rows(sens_list)
+
+# ---- compute averted vs baseline r80_none per R0 --------------------------
+base_key <- sens_grid %>%
+  dplyr::filter(abs(routine - 0.80) < 1e-9, catchup == 0, campaign == "none") %>%
+  dplyr::select(R0, CRS10_base = CRS10, CRS25_base = CRS25)
+
+sens_grid <- sens_grid %>%
+  dplyr::left_join(base_key, by = "R0") %>%
+  dplyr::mutate(
+    Averted10_base80 = CRS10_base - CRS10,
+    Averted25_base80 = CRS25_base - CRS25
+  )
+
+# ---- factorize campaign facet order for plotting --------------------------
+campaign_levels <- c("none", "immediate", "delayed1y", "delayed2y", "delayed3y")
+sens_grid <- sens_grid %>%
+  dplyr::mutate(campaign = factor(campaign, levels = campaign_levels))
+
+# ---- save to disk ---------------------------------------------------------
+readr::write_csv(sens_grid, "outputs/sensitivity_grid_r80baseline.csv")
+message("Saved: outputs/sensitivity_grid_r80baseline.csv")
+```
+
+## Analyse the results
+
+```{r}
+# ============================
+# Step 4B.1 — Compact summaries + 2 essential plots
+# ============================
+
+# Guard: expected columns present
+stopifnot(all(c("R0","routine","catchup","campaign","CRS10","CRS25",
+                "Averted10_base80","Averted25_base80") %in% names(sens_grid)))
+
+# ---- 1) Small CSV summaries -----------------------------------------------
+# Top scenarios by R0 (25y averted)
+top_by_R0 <- sens_grid %>%
+  dplyr::group_by(R0) %>%
+  dplyr::arrange(dplyr::desc(Averted25_base80), .by_group = TRUE) %>%
+  dplyr::slice_head(n = 8) %>%                              # keep 8 per R0 for quick scan
+  dplyr::ungroup()
+
+readr::write_csv(top_by_R0, "outputs/sens_top_by_R0_25y.csv")
+message("Saved: outputs/sens_top_by_R0_25y.csv")
+
+# Overall Top-N across R0 (25y averted)
+top_overall <- sens_grid %>%
+  dplyr::arrange(dplyr::desc(Averted25_base80)) %>%
+  dplyr::slice_head(n = 15)
+
+readr::write_csv(top_overall, "outputs/sens_top_overall_25y.csv")
+message("Saved: outputs/sens_top_overall_25y.csv")
+
+
+# ---- 2) Plot A — Heatmap (immediate only) ---------------------------------
+# High signal, low clutter: only "immediate" campaign, facet by R0
+
+hm_immediate <- sens_grid %>%
+  dplyr::filter(campaign == "immediate") %>%
+  ggplot(aes(x = routine, y = catchup, fill = Averted25_base80)) +
+  geom_tile() +
+  facet_wrap(~ R0, nrow = 1, labeller = label_both) +
+  scale_fill_viridis_c(name = "CRS averted (25y)\nvs r80_none") +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
+  scale_y_continuous("Catch-up coverage", breaks = seq(0, 0.95, by = 0.10), limits = c(0, 0.95)) +
+  labs(title = "Sensitivity (immediate campaign): CRS averted over 25 years",
+       subtitle = "Baseline = routine 80%, no catch-up") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "right",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+ggsave("plots/sens_heatmap_immediate_25y.png", hm_immediate, width = 12, height = 4.5, dpi = 400)
+message("Saved: plots/sens_heatmap_immediate_25y.png")
+
+
+# ---- 3) Plot B — Timing bars at fixed (routine, catchup) ------------------
+# Shows short-term penalty (10y) vs long-term benefit (25y) across timings.
+# Defaults: routine = 0.90, catchup = 0.90; adjust here if needed.
+routine_fix <- 0.90
+catchup_fix <- 0.90
+
+timing_slice <- sens_grid %>%
+  dplyr::filter(abs(routine - routine_fix) < 1e-9,
+                abs(catchup - catchup_fix) < 1e-9,
+                campaign %in% c("immediate","delayed1y","delayed2y","delayed3y")) %>%
+  # reshape to long for twin bars (10y & 25y)
+  dplyr::select(R0, campaign, Averted10_base80, Averted25_base80) %>%
+  tidyr::pivot_longer(cols = c(Averted10_base80, Averted25_base80),
+                      names_to = "horizon", values_to = "averted") %>%
+  dplyr::mutate(
+    horizon = dplyr::recode(horizon,
+                            Averted10_base80 = "10y",
+                            Averted25_base80 = "25y"),
+    # order campaign timing in the intuitive order
+    campaign = factor(campaign, levels = c("immediate","delayed1y","delayed2y","delayed3y"))
+  )
+
+p_timing <- ggplot(timing_slice, aes(x = campaign, y = averted/1000, fill = horizon)) +
+  geom_hline(yintercept = 0, linewidth = 0.5, color = "grey60") +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  facet_wrap(~ R0, nrow = 1, labeller = label_both) +
+  scale_fill_brewer(palette = "Set2", name = NULL) +
+  labs(title = sprintf("Campaign timing at routine=%.0f%%, catch-up=%.0f%%", routine_fix*100, catchup_fix*100),
+       subtitle = "Averted CRS vs r80_none (bars for 10y and 25y horizons)",
+       x = NULL, y = "Averted CRS (thousands)") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "top",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+ggsave("plots/sens_timing_bars_r90_c90.png", p_timing, width = 12, height = 4.5, dpi = 400)
+message("Saved: plots/sens_timing_bars_r90_c90.png")
+```
+
+### More focused slices
+
+```{r}
+# ============================
+# Step 4B.2 — Focused sensitivity slices
+# ============================
+
+# Guard
+stopifnot(exists("sens_grid"))
+stopifnot(all(c("R0","routine","catchup","campaign","Averted10_base80","Averted25_base80") %in% names(sens_grid)))
+
+# ----------------------------
+# 1) Lines: Averted25 vs routine at several catch-up levels (immediate only), faceted by R0
+# ----------------------------
+catch_levels_show <- c(0.30, 0.60, 0.90)  # adjust if needed
+
+line_immediate <- sens_grid %>%
+  filter(campaign == "immediate", catchup %in% catch_levels_show)
+
+# Save the slice as CSV for the appendix
+readr::write_csv(line_immediate, "outputs/sens_slice_immediate_lines.csv")
+
+p_line_imm <- ggplot(line_immediate,
+                     aes(x = routine, y = Averted25_base80/1000, color = factor(catchup))) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "grey60") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  facet_wrap(~ R0, nrow = 1, labeller = label_both) +
+  scale_color_brewer(palette = "Dark2", name = "Catch-up") +
+  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
+  labs(
+    title = "CRS averted over 25y vs routine (immediate campaign)",
+    subtitle = "Baseline = routine 80%, no catch-up; colored by catch-up %",
+    y = "Averted CRS (thousands)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "top",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+ggsave("plots/sens_lines_immediate_25y.png", p_line_imm, width = 12, height = 4.5, dpi = 400)
+message("Saved: plots/sens_lines_immediate_25y.png")
+
+# ----------------------------
+# 2) Mini-heatmap: timing effect at fixed (routine, catchup), per R0
+# ----------------------------
+routine_fix <- 0.90
+catchup_fix <- 0.90
+
+timing_mini <- sens_grid %>%
+  filter(abs(routine - routine_fix) < 1e-9,
+         abs(catchup - catchup_fix) < 1e-9,
+         campaign %in% c("none","immediate","delayed1y","delayed2y","delayed3y")) %>%
+  mutate(campaign = factor(campaign, levels = c("none","immediate","delayed1y","delayed2y","delayed3y")))
+
+readr::write_csv(timing_mini, "outputs/sens_timing_mini.csv")
+
+r0_ticks <- c(6, 7, 8)
+
+p_timing_mini <- ggplot(timing_mini, aes(x = campaign, y = R0, fill = Averted25_base80)) +
+  geom_tile(width = 0.8, height = 0.8) +
+  scale_fill_viridis_c(name = "CRS averted (25y)") +
+  scale_y_continuous(breaks = r0_ticks, labels = r0_ticks) +
+  labs(
+    title = sprintf("Timing effect at routine=%.0f%%, catch-up=%.0f%%", routine_fix*100, catchup_fix*100),
+    subtitle = "Baseline = routine 80%, no catch-up",
+    x = "Campaign timing", y = expression(R[0])
+  ) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "right",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+
+ggsave("plots/sens_timing_mini_heatmap.png", p_timing_mini, width = 8, height = 4.5, dpi = 400)
+message("Saved: plots/sens_timing_mini_heatmap.png")
+
+# ----------------------------
+# 3) Pareto-style scatter: Averted10 vs Averted25 (trade-off), colored by timing
+#    Subset to a small grid to avoid clutter: routine ∈ {0.80, 0.90}, catch-up ∈ {0.60, 0.90}
+# ----------------------------
+routines_keep <- c(0.80, 0.90)
+catch_keep    <- c(0.60, 0.90)
+timings_keep  <- c("none","immediate","delayed1y","delayed2y","delayed3y")
+
+pareto_slim <- sens_grid %>%
+  filter(routine %in% routines_keep,
+         catchup %in% catch_keep,
+         campaign %in% timings_keep)
+
+readr::write_csv(pareto_slim, "outputs/sens_pareto_slim.csv")
+
+p_pareto <- ggplot(pareto_slim,
+                   aes(x = Averted10_base80/1000, y = Averted25_base80/1000,
+                       color = campaign, shape = factor(routine))) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey70", linewidth = 0.4) +
+  geom_point(size = 4, alpha = 0.9) +
+  facet_wrap(~ R0, nrow = 1, labeller = label_both) +
+  scale_color_brewer(palette = "Set1", name = "Timing") +
+  scale_shape_discrete(name = "Routine") +
+  labs(
+    title = "Short-term vs long-term impact (subset)",
+    subtitle = "Averted CRS vs r80_none (10y on x-axis, 25y on y-axis)",
+    x = "Averted CRS (10y, thousands)", y = "Averted CRS (25y, thousands)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "right",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
+
+ggsave("plots/sens_pareto_subset.png", p_pareto, width = 9, height = 3.5, dpi = 400)
+message("Saved: plots/sens_pareto_subset.png")
 ```
 
 ```{r}
-# Keep only panels where catch-up actually varies
-df_heat <- sens_expanded2 |> dplyr::filter(campaign != "none")
+# --- Single-panel lines: Averted25 vs routine (immediate), fixed catch-up, color by R0 ---
+# Purpose: show the three R0 lines together in one panel.
 
-library(ggplot2)
+# Choose the catch-up level to hold fixed (change if needed)
+catchup_fix <- 0.90
 
-# Heatmap: CRS averted, only for "now" and "delay3y"
-p_heat <- ggplot(df_heat, aes(x = routine, y = catchup, fill = CRS10_averted)) +
-  geom_tile() +
-  facet_grid(R0 ~ campaign, labeller = label_both) +
-  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
+line_immediate_onepanel <- sens_grid %>%
+  dplyr::filter(
+    campaign == "immediate",
+    abs(catchup - catchup_fix) < 1e-9
+  )
+
+# Save the exact data slice used (appendix-ready)
+if (!dir.exists("outputs")) dir.create("outputs", recursive = TRUE)
+readr::write_csv(line_immediate_onepanel, "outputs/sens_slice_immediate_lines_onepanel.csv")
+
+p_line_imm_onepanel <- ggplot(line_immediate_onepanel,
+                              aes(x = routine, y = Averted25_base80/1000, color = factor(R0))) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "grey60") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  scale_color_brewer(palette = "Dark2", name = expression(R[0])) +
   scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
-  scale_y_continuous("Catch-up coverage", breaks = seq(0, 0.95, by = 0.10), limits = c(0, 0.95)) +
-  labs(title = "CRS averted vs baseline (routine 80%, no catch-up)",
-       subtitle = "Panels only where catch-up occurs") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "right")
+  labs(
+    title = sprintf("CRS averted over 25y vs routine \n(immediate, catch-up = %.0f%%)", catchup_fix*100),
+    subtitle = "Baseline = routine 80%, no catch-up",
+    y = "Averted CRS (thousands)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "right",
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"))
 
-p_heat
-
-# Optional paradox overlay (red ✖ where paradox is violated)
-baseline_infF <- sens_expanded2 |>
-  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") |>
-  dplyr::select(R0, base_infF = cum_inf_F1544)
-
-df_heat_mark <- df_heat |>
-  dplyr::left_join(baseline_infF, by = "R0") |>
-  dplyr::mutate(paradox_ok = cum_inf_F1544 <= base_infF + 1e-9)
-
-p_heat_mark <- ggplot(df_heat_mark, aes(x = routine, y = catchup, fill = CRS10_averted)) +
-  geom_tile() +
-  geom_point(data = subset(df_heat_mark, !paradox_ok),
-             aes(x = routine, y = catchup),
-             shape = 4, size = 2.2, stroke = 1.1, color = "red") +
-  facet_grid(R0 ~ campaign, labeller = label_both) +
-  scale_fill_viridis_c(option = "C", name = "CRS averted (10y)") +
-  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
-  scale_y_continuous("Catch-up coverage", breaks = seq(0, 0.95, by = 0.10), limits = c(0, 0.95)) +
-  labs(title = "CRS averted (paradox violations marked)",
-       subtitle = "Red ✖ indicates infections in females 15–44 increased vs baseline") +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "right")
-
-p_heat_mark
-
-# Separate, simple plot for "no campaign" (catchup = 0 always)
-df_none <- sens_expanded2 |> dplyr::filter(campaign == "none") |>
-  dplyr::arrange(R0, routine)
-
-p_none <- ggplot(df_none, aes(x = routine, y = CRS10_averted, group = R0, color = as.factor(R0))) +
-  geom_line() + geom_point() +
-  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
-  labs(y = "CRS averted (10y) vs baseline", color = "R0",
-       title = "Routine-only policies (no catch-up)") +
-  theme_minimal(base_size = 12)
-
-p_none
+ggsave("plots/sens_lines_immediate_25y_onepanel.png", p_line_imm_onepanel, width = 5, height = 4, dpi = 400)
+message("Saved: plots/sens_lines_immediate_25y_onepanel.png")
 ```
 
 
