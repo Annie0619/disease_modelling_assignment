@@ -258,164 +258,99 @@ fit_compare_scaled <- fit_compare_locked %>%
   dplyr::mutate(exp_scaled = rho_hat * (sim_fit$results$infections_total[match(year, sim_fit$results$year)]))
 
 cat(sprintf("rho_lit_central = %.5f; rho_hat (mean-level) = %.5f\n", rho_lit_central, rho_hat))
-
-# Quick plot: Observed vs Expected
-plot(fit_compare_locked$year, fit_compare_locked$obs, type = "b", pch = 16,
-     xlab = "Year", ylab = "Reported cases",
-     main = "Observed vs expected (literature-locked R0, rho; stationary demography)", ylim = c(0, max(fit_compare_locked$exp_locked)))
-lines(fit_compare_locked$year, fit_compare_locked$exp_locked, type = "b", pch = 1, lty = 2)
-legend("topright", legend = c("Observed", "Expected (literature)"),
-       pch = c(16,1), lty = c(1,2), bty = "n")
-
-# (Optional) Overlay the level-matched expected series
-lines(fit_compare_scaled$year, fit_compare_scaled$exp_scaled, type = "b", pch = 0, lty = 3)
-legend("topleft", legend = c("Expected (scaled rho)"), pch = 0, lty = 3, bty = "n")
-
-
-# only plot scaled rho with observed
-plot(fit_compare_locked$year, fit_compare_locked$obs, type = "b", pch = 16,
-     xlab = "Year", ylab = "Reported cases",
-     main = "Observed vs expected (literature-locked R0, rho; stationary demography)", ylim = c(0, max(fit_compare_scaled$exp_scaled)))
-#lines(fit_compare_locked$year, fit_compare_locked$exp_locked, type = "b", pch = 1, lty = 2)
-lines(fit_compare_scaled$year, fit_compare_scaled$exp_scaled, type = "b", pch = 0, lty = 3)
-legend("topright", legend = c("Observed", "Expected (scaled rho)"),
-       pch = c(16,0), lty = c(1,3), bty = "n")
-
-legend("topright", legend = c("Expected (scaled rho)"), pch = 0, lty = 3, bty = "n")
-
 ```
 
+
 ```{r}
-# ---- validation: tidy data + publication-ready plots (saves to outputs/) ----
-# Creates two figures:
-#  1) Observed, Expected (literature rho), Expected (scaled rho_hat) on one panel
-#  2) Observed vs Expected (scaled rho_hat) only — cleaner view when lit line is far off
-# Also writes a CSV snapshot of the plotted time series.
-
-# Ensure outputs dir exists
-out_dir <- "outputs"
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-
-# Build a tidy table for plotting & export
-# Join obs, expected (literature rho), and expected (scaled rho_hat)
-val_tbl <- fit_compare_locked %>%
-  dplyr::left_join(
-    fit_compare_scaled %>% dplyr::select(year, exp_scaled),
+# ---- validation: final figure & CSV ---------------------------------------
+# Join observed with expected series
+val_df <- cases_fit %>%
+  dplyr::select(year, obs = cases_reported_total) %>%
+  dplyr::inner_join(
+    sim_fit$results %>% dplyr::select(year, infections_total),
     by = "year"
   ) %>%
-  dplyr::arrange(year)
+  dplyr::mutate(
+    exp_lit    = parms_fit$rho * infections_total,      # Expected using literature rho
+    exp_scaled = rho_hat        * infections_total       # Expected using scaled rho-hat
+  ) %>%
+  dplyr::select(year, obs, exp_lit, exp_scaled)
 
-# Long format for plotting; keep a key for mapping labels
-val_long <- val_tbl %>%
+# Tidy (long) table for plotting and export
+val_long <- val_df %>%
   tidyr::pivot_longer(
-    cols = c(obs, exp_locked, exp_scaled),
-    names_to = "series_key",
+    cols = c(obs, exp_lit, exp_scaled),
+    names_to = "series",
     values_to = "value"
   ) %>%
   dplyr::mutate(
-    series_key = factor(series_key, levels = c("obs","exp_locked","exp_scaled"))
+    # Human-friendly legend with math where appropriate
+    series = factor(series,
+      levels = c("obs","exp_lit","exp_scaled"),
+      labels = c(
+        "Observed (reported)",
+        "Expected (\\u03C1\\u0302[lit])",      # "ρ̂[lit]" via plotmath later
+        "Expected (\\u03C1\\u0302[scaled])"   # "ρ̂[scaled]"
+      )
+    )
   )
 
-# Legend labels:
-#  - Both are estimates of rho; one is literature-based (\hat{rho}_{lit}), the other is scaled (\hat{rho}_{scaled})
-lab_obs <- "Observed"
-lab_lit <- expression("Expected (" * hat(rho)[lit] * ")")
-lab_scl <- expression("Expected (" * hat(rho)[scaled] * ")")
+# Save the tidy table for the report appendix
+readr::write_csv(val_long, "outputs/validation_obs_exp.csv")
+message("Saved: outputs/validation_obs_exp.csv")
 
-# Common style (bigger text, cleaner theme)
-base_size <- 16
-legend_text_size <- 14
-axis_text_size <- 14
-line_size <- 1.05
-point_size <- 2.8
-
-# Helper: y-axis as thousands with a label
-scale_y_thousands <- scale_y_continuous(
-  name   = "Reported cases (thousands)",
-  labels = function(x) scales::comma(x / 1000)
+# --- VALIDATION PLOT (no subtitle; math labels via manual scales) ----------
+series_labels <- c(
+  "Observed (reported)"             = "Observed~(reported)",
+  "Expected (\\u03C1\\u0302[lit])"     = "Expected~~~(hat(rho)[lit])",
+  "Expected (\\u03C1\\u0302[scaled])"  = "Expected~~~(hat(rho)[scaled])"
 )
 
-# ---------- Figure 1: Observed, Expected(\hat{rho}_{lit}), Expected(\hat{rho}_{scaled})
-p_all <- ggplot(val_long, aes(x = year, y = value)) +
-  geom_line(aes(linetype = series_key), linewidth = line_size) +
+p_val <- ggplot(val_long, aes(x = year, y = value/1000, linetype = series, color = series)) +
+  geom_line(linewidth = 1.0) +
   geom_point(
-    data = dplyr::filter(val_long, series_key == "obs"),
-    size = point_size
+    data = subset(val_long, series == "Observed (reported)"),
+    size = 1.8, show.legend = FALSE
+  ) +
+  scale_y_continuous(
+    name   = "Reported cases (thousands)",
+    labels = scales::comma
   ) +
   scale_linetype_manual(
-    name   = NULL,
-    values = c("obs" = "solid", "exp_locked" = "dashed", "exp_scaled" = "dotdash"),
-    breaks = c("obs","exp_locked","exp_scaled"),
-    labels = list(lab_obs, lab_lit, lab_scl)
+    values = c(
+      "Observed (reported)"             = "solid",
+      "Expected (\\u03C1\\u0302[lit])"     = "dashed",
+      "Expected (\\u03C1\\u0302[scaled])"  = "dotdash"
+    ),
+    labels = scales::label_parse()(series_labels[levels(val_long$series)])
   ) +
-  scale_y_thousands +
+  scale_color_manual(
+    values = c(
+      "Observed (reported)"             = "#1b9e77",
+      "Expected (\\u03C1\\u0302[lit])"     = "#d95f02",
+      "Expected (\\u03C1\\u0302[scaled])"  = "#7570b3"
+    ),
+    labels = scales::label_parse()(series_labels[levels(val_long$series)])
+  ) +
+  guides(
+    linetype = guide_legend(title = NULL, label.hjust = 0),
+    color    = "none"
+  ) +
   labs(
-    title = "Observed vs expected reported cases",
-    subtitle = "Stationary demography; no vaccination in fit window",
+    title = "Observed vs expected reported rubella cases",
     x = "Year"
   ) +
-  theme_bw(base_size = base_size) +
+  theme_bw(base_size = 15) +
   theme(
-    legend.position = "right",
-    legend.justification = "top",
-    plot.margin = margin(10, 20, 10, 10),
-    legend.text = element_text(size = legend_text_size),
-    axis.text  = element_text(size = axis_text_size),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(face = "bold")
-  ) +
-  guides(linetype = guide_legend(override.aes = list(linewidth = 1.3)))
+    legend.position   = "right",
+    legend.box        = "vertical",
+    legend.text       = element_text(size = 12),
+    panel.grid.minor  = element_blank(),
+    plot.title        = element_text(face = "bold")
+  )
 
-ggsave("plots/validation_obs_expected_all.png",
-       plot = p_all, width = 8, height = 5, dpi = 400)
-
-# ---------- Figure 2: Observed vs Expected(\hat{rho}_{scaled}) only (cleaner)
-val_long_scaled <- dplyr::filter(val_long, series_key %in% c("obs","exp_scaled"))
-
-p_scaled <- ggplot(val_long_scaled, aes(x = year, y = value)) +
-  geom_line(aes(linetype = series_key), linewidth = line_size) +
-  geom_point(
-    data = dplyr::filter(val_long_scaled, series_key == "obs"),
-    size = point_size
-  ) +
-  scale_linetype_manual(
-    name   = NULL,
-    values = c("obs" = "solid", "exp_scaled" = "dotdash"),
-    breaks = c("obs","exp_scaled"),
-    labels = list(lab_obs, lab_scl)
-  ) +
-  scale_y_thousands +
-  labs(
-    title = "Observed vs expected",
-    subtitle = expression(paste("Both use ", hat(rho), "; curve shows ", hat(rho)[scaled], " (mean-level rescale)")),
-    x = "Year"
-  ) +
-  theme_bw(base_size = base_size) +
-  theme(
-    legend.position = "right",
-    legend.justification = "top",
-    plot.margin = margin(10, 20, 10, 10),
-    legend.text = element_text(size = legend_text_size),
-    axis.text  = element_text(size = axis_text_size),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(face = "bold")
-  ) +
-  guides(linetype = guide_legend(override.aes = list(linewidth = 1.3)))
-
-ggsave("plots/validation_obs_expected_scaled.png",
-       plot = p_scaled, width = 8, height = 5, dpi = 400)
-
-
-# ---------------------------
-# Export the numbers used in the plot(s)
-# ---------------------------
-readr::write_csv(val_tbl, file.path(out_dir, "validation_series_table.csv"))
-
-# Console message
-message("Saved: ",
-        file.path(out_dir, "validation_obs_expected_all.png"), " ; ",
-        file.path(out_dir, "validation_obs_expected_scaled.png"), " ; ",
-        file.path(out_dir, "validation_series_table.csv"))
+ggsave("plots/validation_obs_vs_exp.png", p_val, width = 7, height = 4, dpi = 400)
+message("Saved: plots/validation_obs_vs_exp.png")
 ```
 
 
@@ -583,15 +518,6 @@ apply_delay <- function(cov_tbl, start_year, campaign_year, zero_routine = TRUE)
 
 
 Compare multiple years.
-
-```{r}
-# Compute CRS over an arbitrary window from a results data frame
-crs_sum_window <- function(df, start_year, years) {
-  stopifnot(all(c("year","crs") %in% names(df)))
-  yr_max <- start_year + years - 1L
-  sum(df$crs[df$year >= start_year & df$year <= yr_max], na.rm = TRUE)
-}
-```
 
 ```{r}
 # ---------------------------------------------
@@ -1443,4 +1369,79 @@ ggsave("plots/sens_lines_immediate_25y_onepanel.png", p_line_imm_onepanel, width
 message("Saved: plots/sens_lines_immediate_25y_onepanel.png")
 ```
 
+```{r}
+# --- Break-even routine threshold (25y, catch-up = 90%, immediate) ---------
+sens_immed_90 <- sens_grid %>%
+  dplyr::filter(campaign == "immediate", abs(catchup - 0.90) < 1e-9)
+
+breakeven <- sens_immed_90 %>%
+  dplyr::group_by(R0) %>%
+  dplyr::arrange(routine, .by_group = TRUE) %>%
+  dplyr::summarise(
+    routine_break_even = {
+      idx <- which(Averted25_base80 > 0)
+      if (length(idx) == 0) NA_real_ else min(routine[idx])
+    },
+    .groups = "drop"
+  )
+
+p_be <- ggplot(sens_immed_90, aes(x = routine, y = Averted25_base80/1000, color = factor(R0))) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  geom_vline(data = breakeven, aes(xintercept = routine_break_even, color = factor(R0)),
+             linetype = "dashed") +
+  labs(title = "Break-even routine coverage (25y, catch-up 90% immediate)",
+       subtitle = "Dashed = minimum routine where 25y averted CRS > 0 vs r80_none",
+       x = "Routine coverage", y = "Averted CRS (thousands)", color = "R₀") +
+  theme_bw(base_size = 14)
+
+ggsave("plots/sens_breakeven_routine_25y.png", p_be, width = 9, height = 5, dpi = 400)
+```
+
+```{r}
+# Mark cells that increase infections among females 15–44 vs baseline r80_none
+
+# Build the baseline for cum_inf_F1544 per R0
+base_infF <- sens_grid %>%
+  filter(routine==0.80, catchup==0, campaign=="none") %>%
+  select(R0, base_infF = cum_inf_F1544)
+
+plot_df <- sens_grid %>%
+  filter(campaign=="immediate") %>%
+  left_join(base_infF, by="R0") %>%
+  mutate(paradox_flag = cum_inf_F1544 > base_infF + 1e-9)  # TRUE = worse than baseline
+
+gg <- ggplot(plot_df, aes(x=routine, y=catchup, fill=Averted25_base80)) +
+  geom_tile() +
+  geom_point(data=subset(plot_df, paradox_flag),
+             aes(x=routine, y=catchup), shape=4, stroke=1.1, size=2, color="red") +
+  facet_wrap(~R0, nrow=1, labeller=label_both) +
+  scale_fill_viridis_c(option="C", name="CRS averted (25y)") +
+  labs(title="Immediate campaign: CRS averted over 25y with paradox flags",
+       subtitle="Red × = cumulative infections in females 15–44 exceed r80_none",
+       x="Routine", y="Catch-up") +
+  theme_bw(base_size=14)
+ggsave("plots/sens_heatmap_immediate_25y_paradox.png", gg, width=12, height=4.5, dpi=400)
+```
+
+```{r}
+# save top 5 options
+
+# Top 5 strategies per R0 by 25y averted CRS (k = thousands)
+top5 <- sens_grid %>%
+  dplyr::filter(campaign != "none") %>%
+  dplyr::group_by(R0) %>%
+  dplyr::arrange(dplyr::desc(Averted25_base80), .by_group = TRUE) %>%
+  dplyr::transmute(
+    R0,
+    Routine = routine,
+    CatchUp = catchup,
+    Timing  = as.character(campaign),
+    `Averted CRS (25y, k)` = round(Averted25_base80 / 1000, 1)
+  ) %>%
+  dplyr::slice_head(n = 5) %>%
+  dplyr::ungroup()
+
+readr::write_csv(top5, "outputs/sens_top5_per_R0_25y.csv")
+top5
+```
 
