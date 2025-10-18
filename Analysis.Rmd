@@ -602,6 +602,12 @@ scenarios <- tibble::tibble(
     )
   )
 
+crs_sum_window <- function(df, start_year, years) {
+  # Sum CRS in [start_year, start_year + years - 1]
+  stopifnot(all(c("year","crs") %in% names(df)))
+  yr_max <- start_year + years - 1L
+  sum(df$crs[df$year >= start_year & df$year <= yr_max], na.rm = TRUE)
+}
 
 # ---- run scenarios using generic delay handler + auto labels ----
 scenario_results <- list()
@@ -979,12 +985,7 @@ FAST_TEST <- FALSE
 # ---- policy years & helper for windowed CRS sums ----
 years_policy <- start_year:(start_year + horizon_years - 1)
 
-crs_sum_window <- function(df, start_year, years) {
-  # Sum CRS in [start_year, start_year + years - 1]
-  stopifnot(all(c("year","crs") %in% names(df)))
-  yr_max <- start_year + years - 1L
-  sum(df$crs[df$year >= start_year & df$year <= yr_max], na.rm = TRUE)
-}
+
 
 # ---- grid choices (thin if FAST_TEST) ----
 R0_vals      <- if (FAST_TEST) c(7.0)                else c(6.0, 7.0, 8.0)
@@ -1158,22 +1159,41 @@ message("Saved: outputs/sens_top_overall_25y.csv")
 # ---- 2) Plot A — Heatmap (immediate only) ---------------------------------
 # High signal, low clutter: only "immediate" campaign, facet by R0
 
+library(scales)
+
 hm_immediate <- sens_grid %>%
   dplyr::filter(campaign == "immediate") %>%
   ggplot(aes(x = routine, y = catchup, fill = Averted25_base80)) +
   geom_tile() +
   facet_wrap(~ R0, nrow = 1, labeller = label_both) +
   scale_fill_viridis_c(name = "CRS averted (25y)\nvs r80_none") +
-  scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
-  scale_y_continuous("Catch-up coverage", breaks = seq(0, 0.95, by = 0.10), limits = c(0, 0.95)) +
+  scale_x_continuous(
+    "Routine coverage",
+    breaks = seq(0.50, 0.95, by = 0.05),
+    limits = c(0.50, 0.95),
+    labels = label_percent(accuracy = 1)
+
+  ) +
+  scale_y_continuous(
+    "Catch-up coverage",
+    breaks = seq(0.00, 0.95, by = 0.10),
+    limits = c(0.00, 0.95),
+    labels = label_percent(accuracy = 1)
+
+  ) +
   labs(title = "Sensitivity (immediate campaign): CRS averted over 25 years",
        subtitle = "Baseline = routine 80%, no catch-up") +
   theme_bw(base_size = 14) +
   theme(legend.position = "right",
         panel.grid.minor = element_blank(),
-        plot.title = element_text(face = "bold"))
+        plot.title = element_text(face = "bold"))+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)  # optional: default margins
+  )
 
-ggsave("plots/sens_heatmap_immediate_25y.png", hm_immediate, width = 12, height = 4.5, dpi = 400)
+
+ggsave("plots/sens_heatmap_immediate_25y.png", hm_immediate, width = 10, height = 3.5, dpi = 400)
 message("Saved: plots/sens_heatmap_immediate_25y.png")
 
 
@@ -1204,15 +1224,24 @@ p_timing <- ggplot(timing_slice, aes(x = campaign, y = averted/1000, fill = hori
   geom_col(position = position_dodge(width = 0.7), width = 0.6) +
   facet_wrap(~ R0, nrow = 1, labeller = label_both) +
   scale_fill_brewer(palette = "Set2", name = NULL) +
-  labs(title = sprintf("Campaign timing at routine=%.0f%%, catch-up=%.0f%%", routine_fix*100, catchup_fix*100),
-       subtitle = "Averted CRS vs r80_none (bars for 10y and 25y horizons)",
-       x = NULL, y = "Averted CRS (thousands)") +
+  scale_x_discrete(
+    limits = c("immediate","delayed1y","delayed2y","delayed3y"),
+    labels = c("immediate","1yr","2yr","3yr")
+  ) +
+  labs(
+    title = sprintf("Campaign timing at routine=%.0f%%, catch-up=%.0f%%", routine_fix*100, catchup_fix*100),
+    subtitle = "Averted CRS vs r80_none (bars for 10y and 25y horizons)",
+    x = NULL, y = "Averted CRS (thousands)"
+  ) +
   theme_bw(base_size = 14) +
-  theme(legend.position = "top",
-        panel.grid.minor = element_blank(),
-        plot.title = element_text(face = "bold"))
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
 
-ggsave("plots/sens_timing_bars_r90_c90.png", p_timing, width = 12, height = 4.5, dpi = 400)
+
+ggsave("plots/sens_timing_bars_r90_c90.png", p_timing, width = 9, height = 4, dpi = 400)
 message("Saved: plots/sens_timing_bars_r90_c90.png")
 ```
 
@@ -1251,12 +1280,12 @@ p_line_imm <- ggplot(line_immediate,
     subtitle = "Baseline = routine 80%, no catch-up; colored by catch-up %",
     y = "Averted CRS (thousands)"
   ) +
-  theme_bw(base_size = 14) +
+  theme_bw(base_size = 12) +
   theme(legend.position = "top",
         panel.grid.minor = element_blank(),
         plot.title = element_text(face = "bold"))
 
-ggsave("plots/sens_lines_immediate_25y.png", p_line_imm, width = 12, height = 4.5, dpi = 400)
+ggsave("plots/sens_lines_immediate_25y.png", p_line_imm, width = 7, height = 4, dpi = 400)
 message("Saved: plots/sens_lines_immediate_25y.png")
 
 # ----------------------------
@@ -1356,7 +1385,7 @@ p_line_imm_onepanel <- ggplot(line_immediate_onepanel,
   scale_color_brewer(palette = "Dark2", name = expression(R[0])) +
   scale_x_continuous("Routine coverage", breaks = seq(0.5, 0.95, by = 0.05), limits = c(0.5, 0.95)) +
   labs(
-    title = sprintf("CRS averted over 25y vs routine \n(immediate, catch-up = %.0f%%)", catchup_fix*100),
+    title = sprintf("CRS averted over 25y vs routine (immediate, catch-up = %.0f%%)", catchup_fix*100),
     subtitle = "Baseline = routine 80%, no catch-up",
     y = "Averted CRS (thousands)"
   ) +
@@ -1365,7 +1394,7 @@ p_line_imm_onepanel <- ggplot(line_immediate_onepanel,
         panel.grid.minor = element_blank(),
         plot.title = element_text(face = "bold"))
 
-ggsave("plots/sens_lines_immediate_25y_onepanel.png", p_line_imm_onepanel, width = 5, height = 4, dpi = 400)
+ggsave("plots/sens_lines_immediate_25y_onepanel.png", p_line_imm_onepanel, width = 7, height = 4, dpi = 400)
 message("Saved: plots/sens_lines_immediate_25y_onepanel.png")
 ```
 
@@ -1392,9 +1421,12 @@ p_be <- ggplot(sens_immed_90, aes(x = routine, y = Averted25_base80/1000, color 
   labs(title = "Break-even routine coverage (25y, catch-up 90% immediate)",
        subtitle = "Dashed = minimum routine where 25y averted CRS > 0 vs r80_none",
        x = "Routine coverage", y = "Averted CRS (thousands)", color = "R₀") +
-  theme_bw(base_size = 14)
+  theme_bw(base_size = 12)+
+  theme(
+    plot.title = element_text(face = "bold")          # <- bold title
+  )
 
-ggsave("plots/sens_breakeven_routine_25y.png", p_be, width = 9, height = 5, dpi = 400)
+ggsave("plots/sens_breakeven_routine_25y.png", p_be, width = 7, height = 4, dpi = 400)
 ```
 
 ```{r}
@@ -1419,8 +1451,11 @@ gg <- ggplot(plot_df, aes(x=routine, y=catchup, fill=Averted25_base80)) +
   labs(title="Immediate campaign: CRS averted over 25y with paradox flags",
        subtitle="Red × = cumulative infections in females 15–44 exceed r80_none",
        x="Routine", y="Catch-up") +
-  theme_bw(base_size=14)
-ggsave("plots/sens_heatmap_immediate_25y_paradox.png", gg, width=12, height=4.5, dpi=400)
+  theme_bw(base_size=14)+
+  theme(
+    plot.title = element_text(face = "bold")          # <- bold title
+  )
+ggsave("plots/sens_heatmap_immediate_25y_paradox.png", gg, width=10, height=3.5, dpi=400)
 ```
 
 ```{r}
