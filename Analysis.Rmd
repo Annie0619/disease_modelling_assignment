@@ -366,27 +366,40 @@ run_horizon_with_paradox <- function(y_start, start_year, n_years, pr, mdl, shar
 # Policy Scenario Testing
 
 ```{r}
-# ---------------------------------------------
-# Build a coverage table for a scenario
-# Inputs:
-#   years        : integer vector (e.g., start_year:(start_year + horizon_years - 1))
-#   p_routine    : routine coverage in [0,1], applied to every year
-#   campaign_year: integer year for one-time catch-up (or NULL for none)
-#   p_catchup    : catch-up coverage in [0,1] (ignored if campaign_year is NULL)
-# Returns:
-#   data.frame with cols: year, routine_coverage, catchup_coverage
-make_coverage_scenario <- function(years, p_routine, campaign_year = NULL, p_catchup = NULL) {
+# ---- Build a coverage table for a scenario (with optional age-band) ----
+# years         : integer vector for policy years
+# p_routine     : routine coverage in [0,1]
+# campaign_year : integer year for one-time catch-up (or NULL for none)
+# p_catchup     : catch-up coverage in [0,1]
+# catch_min_age : integer lower bound (default 1)
+# catch_max_age : integer upper bound, inclusive (default 14)
+# catch_age0_frac : numeric in (0,1], only used if min_age == 0 (default NA => treat as 1 for age 0)
+make_coverage_scenario <- function(
+    years,
+    p_routine,
+    campaign_year = NULL,
+    p_catchup     = NULL,
+    catch_min_age = 1L,
+    catch_max_age = 14L,
+    catch_age0_frac = NA_real_
+) {
   stopifnot(p_routine >= 0, p_routine <= 1)
+
   cov <- tibble::tibble(
     year = years,
     routine_coverage = p_routine,
-    catchup_coverage = NA_real_
+    catchup_coverage = NA_real_,
+    catch_min_age    = as.integer(catch_min_age),
+    catch_max_age    = as.integer(catch_max_age),
+    catch_age0_frac  = as.numeric(catch_age0_frac)
   )
+
   if (!is.null(campaign_year)) {
     stopifnot(campaign_year %in% years)
     stopifnot(!is.null(p_catchup), p_catchup >= 0, p_catchup <= 1)
     cov$catchup_coverage[cov$year == campaign_year] <- p_catchup
   }
+
   cov
 }
 ```
@@ -418,19 +431,33 @@ campaign_label <- function(campaign_year, start_year) {
 }
 
 
-# For any delayed campaign, enforce NO vaccination during the delay window:
-#   - routine_coverage = 0
-#   - catchup_coverage = NA, for years start_year .. (campaign_year-1)
-apply_delay_zero_vax <- function(cov_tbl, start_year, campaign_year) {
+# ---- helper: delay handling with optional routine suspension -------------
+# Suppress catch-up before the campaign year. Optionally set routine=0
+# during the delay window (years: start_year .. campaign_year-1).
+apply_delay <- function(cov_tbl, start_year, campaign_year, zero_routine = TRUE) {
   if (is.na(campaign_year) || campaign_year <= start_year) return(cov_tbl)
   delay_years <- seq.int(start_year, campaign_year - 1L)
-  cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
+  # Catch-up is always absent before the campaign
   cov_tbl$catchup_coverage[cov_tbl$year %in% delay_years] <- NA_real_
+  # Optionally suspend routine during the delay
+  if (isTRUE(zero_routine)) {
+    cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
+  }
   cov_tbl
 }
-
 ```
 
+
+Compare multiple years.
+
+```{r}
+# Compute CRS over an arbitrary window from a results data frame
+crs_sum_window <- function(df, start_year, years) {
+  stopifnot(all(c("year","crs") %in% names(df)))
+  yr_max <- start_year + years - 1L
+  sum(df$crs[df$year >= start_year & df$year <= yr_max], na.rm = TRUE)
+}
+```
 
 ```{r}
 # ---------------------------------------------
@@ -467,21 +494,54 @@ y_start_locked <- burn_in_mdl(
 years_policy <- start_year:(start_year + horizon_years - 1)
 
 # Define a compact set of illustrative scenarios (mix of routine, catch-up %, and delays)
+# ---- scenarios: add age-band columns and two 9m–9y variants ----
 scenarios <- tibble::tibble(
   id         = c("r80_none", "r90_none",
                  "r80_c90_now", "r90_c90_now",
-                 "r90_c90_d1", "r90_c90_d2", "r90_c90_d3"),
-  routine    = c(0.80, 0.90,  0.80, 0.90,  0.90, 0.90, 0.90),
-  catch_cov  = c(NA,   NA,    0.90, 0.90,  0.90, 0.90, 0.90),
-  catch_year = c(NA,   NA,    start_year, start_year,
-                 start_year + 1L, start_year + 2L, start_year + 3L)
+                 "r90_c90_d1", "r90_c90_d2", "r90_c90_d3",
+                 "r90_c90_d1_keepR", "r90_c90_d2_keepR", "r90_c90_d3_keepR",
+                 "r90_c90_now_9m9y", "r90_c90_d1_9m9y_keepR"),
+  routine    = c(0.80, 0.90,
+                 0.80, 0.90,
+                 0.90, 0.90, 0.90,
+                 0.90, 0.90, 0.90,
+                 0.90, 0.90),
+  catch_cov  = c(NA,   NA,
+                 0.90, 0.90,
+                 0.90, 0.90, 0.90,
+                 0.90, 0.90, 0.90,
+                 0.90, 0.90),
+  catch_year = c(NA,   NA,
+                 start_year, start_year,
+                 start_year + 1L, start_year + 2L, start_year + 3L,
+                 start_year + 1L, start_year + 2L, start_year + 3L,
+                 start_year,       start_year + 1L),
+  delay_zero_routine = c(FALSE, FALSE,
+                         FALSE, FALSE,
+                         TRUE, TRUE, TRUE,
+                         FALSE, FALSE, FALSE,
+                         FALSE, FALSE),
+  # Default band: 1–14 (full age-0 not used)
+  catch_min_age = c(rep(1L, 10),   0L,              0L),
+  catch_max_age = c(rep(14L, 10),  9L,              9L),
+  catch_age0_frac = c(rep(NA_real_, 10), 0.25,      0.25)
 ) %>%
   dplyr::mutate(
+    band_label = dplyr::if_else(catch_min_age == 0L,
+                                "9m–9y", "1–14y"),
     label = dplyr::case_when(
       is.na(catch_year) ~ paste0("Routine ", scales::percent(routine), " (no catch-up)"),
-      TRUE ~ paste0("Catch-up 1–14 @", scales::percent(catch_cov), " (", campaign_label(catch_year, start_year), "), Routine ", scales::percent(routine))
+      !delay_zero_routine & (catch_year > start_year) ~ paste0(
+        "Catch-up ", band_label, " @", scales::percent(catch_cov),
+        " (", campaign_label(catch_year, start_year), ", routine ON), Routine ", scales::percent(routine)
+      ),
+      TRUE ~ paste0(
+        "Catch-up ", band_label, " @", scales::percent(catch_cov),
+        " (", campaign_label(catch_year, start_year), "), Routine ", scales::percent(routine)
+      )
     )
   )
+
 
 # ---- run scenarios using generic delay handler + auto labels ----
 scenario_results <- list()
@@ -490,15 +550,24 @@ for (i in seq_len(nrow(scenarios))) {
   sc <- scenarios[i, ]
 
   # Build coverage for this scenario
+  # Build coverage for this scenario (pass age-band parameters)
   cov_tbl <- make_coverage_scenario(
-    years         = years_policy,
-    p_routine     = sc$routine,
-    campaign_year = if (is.na(sc$catch_year)) NULL else sc$catch_year,
-    p_catchup     = if (is.na(sc$catch_cov))  NULL else sc$catch_cov
+    years           = years_policy,
+    p_routine       = sc$routine,
+    campaign_year   = if (is.na(sc$catch_year)) NULL else sc$catch_year,
+    p_catchup       = if (is.na(sc$catch_cov))  NULL else sc$catch_cov,
+    catch_min_age   = sc$catch_min_age,
+    catch_max_age   = sc$catch_max_age,
+    catch_age0_frac = sc$catch_age0_frac
   )
 
-  # Enforce zero vaccination during any delay window
-  cov_tbl <- apply_delay_zero_vax(cov_tbl, start_year = start_year, campaign_year = sc$catch_year)
+  # Enforce delay rule: always suppress catch-up before campaign; optionally suspend   routine
+  cov_tbl <- apply_delay(
+    cov_tbl,
+    start_year     = start_year,
+    campaign_year  = sc$catch_year,
+    zero_routine   = sc$delay_zero_routine
+  )
 
   # Clone model with scenario-specific coverage
   mdl_sc <- clone_with_coverage(mdl, cov_tbl)
@@ -518,21 +587,25 @@ for (i in seq_len(nrow(scenarios))) {
 
   df <- run_sc$results
 
+  CRS10_val <- crs_sum_window(df, start_year = start_year, years = 10)
+  CRS25_val <- crs_sum_window(df, start_year = start_year, years = 25)
+
   scenario_results[[sc$id]] <- list(
     summary  = tibble::tibble(
-      id         = sc$id,
-      label      = sc$label,
-      routine    = sc$routine,
-      catch_year = sc$catch_year,
-      catch_cov  = sc$catch_cov,
-      campaign   = campaign_label(sc$catch_year, start_year),
-      CRS10      = sum(df$crs, na.rm = TRUE),
-      cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
-      mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
-    ),
-    timeseries = df,
-    coverage   = cov_tbl
-  )
+    id         = sc$id,
+    label      = sc$label,
+    routine    = sc$routine,
+    catch_year = sc$catch_year,
+    catch_cov  = sc$catch_cov,
+    campaign   = campaign_label(sc$catch_year, start_year),
+    CRS10      = CRS10_val,
+    CRS25      = CRS25_val,
+    cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
+    mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
+  ),
+  timeseries = df,
+  coverage   = cov_tbl
+)
 }
 
 # Collect a summary table
@@ -545,20 +618,21 @@ How much better is this than baseline.
 ```{r}
 # ---- CRS averted vs baseline (baseline = Routine 80% + no catch-up) ----
 # Select baseline row dynamically (in case labels/ids change)
+# Choose which horizon to compare
+metric <- "CRS10"   # or "CRS25"
+
 baseline_row <- scenario_summary %>%
   dplyr::filter(is.na(catch_year), abs(routine - 0.80) < 1e-9) %>%
   dplyr::slice(1)
 
 stopifnot(nrow(baseline_row) == 1)
-CRS10_baseline <- baseline_row$CRS10
+base_val <- baseline_row[[metric]]
 
 scenario_summary <- scenario_summary %>%
   dplyr::mutate(
-    CRS10_averted = CRS10_baseline - CRS10
+    Averted = base_val - .data[[metric]]
   ) %>%
-  dplyr::arrange(dplyr::desc(CRS10_averted))
-
-scenario_summary
+  dplyr::arrange(dplyr::desc(Averted))
 ```
 
 # Sensitivity check
@@ -611,7 +685,7 @@ for (R0v in R0_vals_exp) {
         )
 
         # Apply zero-vax during delay window (generic)
-        cov_tbl <- apply_delay_zero_vax(cov_tbl, start_year = start_year, campaign_year = cy)
+        cov_tbl <- apply_delay(cov_tbl, start_year = start_year, campaign_year = cy)
 
         # Clone model with coverage
         mdl_sc <- clone_with_coverage(mdl, cov_tbl)

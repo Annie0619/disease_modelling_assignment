@@ -205,15 +205,62 @@ apply_routine_mdl <- function(y, yr, mdl, cov_tbl, VE) {
   y
 }
 
+# ----------------------------------------------
+# ---- apply_catchup_mdl (age-banded, with age-0 fraction) -----------------
+# Moves a fraction of susceptibles (S) into recovered (R) during the campaign year.
+# Coverage table may include:
+#   - catchup_coverage: scalar in [0,1]
+#   - catch_min_age   : integer (default 1)
+#   - catch_max_age   : integer, inclusive (default 14)
+#   - catch_age0_frac : numeric in (0,1], only used if min_age == 0 (default NA => 1)
 apply_catchup_mdl <- function(y, yr, mdl, cov_tbl, VE) {
-  cov <- cov_tbl |> dplyr::filter(year == yr) |> dplyr::pull(catchup_coverage)
+  # Read catch-up coverage for this year
+  row <- cov_tbl |> dplyr::filter(year == yr)
+  if (nrow(row) == 0) return(y)
+  
+  cov <- row$catchup_coverage[1]
   if (length(cov) == 0 || is.na(cov) || cov <= 0) return(y)
+  
+  # Derive effective vaccine take
   eff <- max(0, min(cov * VE, 1))
+  
+  # Read optional age-band parameters with defaults
+  min_age <- if ("catch_min_age" %in% names(row) && !is.na(row$catch_min_age[1])) as.integer(row$catch_min_age[1]) else 1L
+  max_age <- if ("catch_max_age" %in% names(row) && !is.na(row$catch_max_age[1])) as.integer(row$catch_max_age[1]) else 14L
+  age0_fr <- if ("catch_age0_frac" %in% names(row) && !is.na(row$catch_age0_frac[1])) as.numeric(row$catch_age0_frac[1]) else NA_real_
+  
+  # Guardrails and clipping
+  min_age <- max(0L, min(mdl$ages, na.rm = TRUE), min_age)
+  max_age <- min( max(mdl$ages, na.rm = TRUE), max_age)
+  if (max_age < min_age) return(y)
+  
+  # Build list of ages to vaccinate fully (single-year ages)
+  ages_full <- seq.int(from = max(min_age, 1L), to = max_age)  # ages >=1
+  # Special handling for age 0 if min_age==0
+  include_age0 <- (min_age == 0L)
+  
   for (sx in mdl$sexes) {
-    cells <- vapply(1:14, function(a) mdl$cell_index(sx, a), integer(1))
-    iS <- mdl$idx$S[cells]; iR <- mdl$idx$R[cells]
-    move <- eff * y[iS]
-    y[iS] <- y[iS] - move; y[iR] <- y[iR] + move
+    # Fully covered ages (>=1)
+    if (length(ages_full) > 0) {
+      cells_full <- vapply(ages_full, function(a) mdl$cell_index(sx, a), integer(1))
+      iS_full <- mdl$idx$S[cells_full]
+      iR_full <- mdl$idx$R[cells_full]
+      move_full <- eff * y[iS_full]
+      y[iS_full] <- y[iS_full] - move_full
+      y[iR_full] <- y[iR_full] + move_full
+    }
+    
+    # Partially covered age 0 (if applicable)
+    if (isTRUE(include_age0)) {
+      frac0 <- if (is.na(age0_fr)) 1.0 else max(0.0, min(1.0, age0_fr))
+      if (frac0 > 0) {
+        iS0 <- mdl$idx$S[ mdl$cell_index(sx, 0L) ]
+        iR0 <- mdl$idx$R[ mdl$cell_index(sx, 0L) ]
+        move0 <- eff * frac0 * y[iS0]
+        y[iS0] <- y[iS0] - move0
+        y[iR0] <- y[iR0] + move0
+      }
+    }
   }
   y
 }
