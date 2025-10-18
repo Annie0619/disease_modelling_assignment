@@ -391,6 +391,7 @@ make_coverage_scenario <- function(years, p_routine, campaign_year = NULL, p_cat
 }
 ```
 
+
 ```{r}
 # define and run scenarios
 # ---------------------------------------------
@@ -401,10 +402,37 @@ clone_with_coverage <- function(mdl, coverage_new) {
   mdl2
 }
 
-# ---------------------------------------------
-# Policy years we will simulate
-years_policy <- start_year:(start_year + horizon_years - 1)
+# ---- helpers: campaign labeling and zero-vax delay handling ----
 
+# ---- helper: vectorized campaign label -----------------------------------
+campaign_label <- function(campaign_year, start_year) {
+  # Returns "none", "immediate", or "delayed{k}y" for each element of campaign_year
+  out <- ifelse(
+    is.na(campaign_year), "none",
+    ifelse(
+      campaign_year == start_year, "immediate",
+      paste0("delayed", as.integer(campaign_year - start_year), "y")
+    )
+  )
+  out
+}
+
+
+# For any delayed campaign, enforce NO vaccination during the delay window:
+#   - routine_coverage = 0
+#   - catchup_coverage = NA, for years start_year .. (campaign_year-1)
+apply_delay_zero_vax <- function(cov_tbl, start_year, campaign_year) {
+  if (is.na(campaign_year) || campaign_year <= start_year) return(cov_tbl)
+  delay_years <- seq.int(start_year, campaign_year - 1L)
+  cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
+  cov_tbl$catchup_coverage[cov_tbl$year %in% delay_years] <- NA_real_
+  cov_tbl
+}
+
+```
+
+
+```{r}
 # ---------------------------------------------
 # Define locked literature parameters/burn-in
 R0_lit_central   <- 7.9            # SA anchor; vary in sensitivity later
@@ -429,54 +457,58 @@ y_start_locked <- burn_in_mdl(
   share_F    = share_F,
   share_M    = share_M
 )
+```
 
-# ---------------------------------------------
-# Define a small, clear scenario set
+
+```{r}
+# ---- scenarios: define with campaign_year; labels derived by helper ----
+
+# Policy years
+years_policy <- start_year:(start_year + horizon_years - 1)
+
+# Define a compact set of illustrative scenarios (mix of routine, catch-up %, and delays)
 scenarios <- tibble::tibble(
-  id    = c("baseline80",         "baseline90",
-            "catchup90_r80",      "catchup90_r90",
-            "delay3y_catchup90_r90"),
-  label = c("Routine 80% (no catch-up)",
-            "Routine 90% (no catch-up)",
-            "Catch-up 1–14 @90% + Routine 80%",
-            "Catch-up 1–14 @90% + Routine 90%",
-            "Delay 3y then Catch-up 1–14 @90% + Routine 90%"),
-  routine = c(0.80, 0.90, 0.80, 0.90, 0.90),
-  catch_year = c(NA, NA, start_year, start_year, start_year + 3),
-  catch_cov  = c(NA, NA, 0.90, 0.90, 0.90)
-)
+  id         = c("r80_none", "r90_none",
+                 "r80_c90_now", "r90_c90_now",
+                 "r90_c90_d1", "r90_c90_d2", "r90_c90_d3"),
+  routine    = c(0.80, 0.90,  0.80, 0.90,  0.90, 0.90, 0.90),
+  catch_cov  = c(NA,   NA,    0.90, 0.90,  0.90, 0.90, 0.90),
+  catch_year = c(NA,   NA,    start_year, start_year,
+                 start_year + 1L, start_year + 2L, start_year + 3L)
+) %>%
+  dplyr::mutate(
+    label = dplyr::case_when(
+      is.na(catch_year) ~ paste0("Routine ", scales::percent(routine), " (no catch-up)"),
+      TRUE ~ paste0("Catch-up 1–14 @", scales::percent(catch_cov), " (", campaign_label(catch_year, start_year), "), Routine ", scales::percent(routine))
+    )
+  )
 
-# ---------------------------------------------
-# Runner over scenarios
+# ---- run scenarios using generic delay handler + auto labels ----
 scenario_results <- list()
+
 for (i in seq_len(nrow(scenarios))) {
   sc <- scenarios[i, ]
 
-  # Build coverage table for this scenario
+  # Build coverage for this scenario
   cov_tbl <- make_coverage_scenario(
-    years        = years_policy,
-    p_routine    = sc$routine,
+    years         = years_policy,
+    p_routine     = sc$routine,
     campaign_year = if (is.na(sc$catch_year)) NULL else sc$catch_year,
     p_catchup     = if (is.na(sc$catch_cov))  NULL else sc$catch_cov
   )
 
-  # For the "delay 3y" scenario: enforce routine=0 and no catch-up during the delay years,
-  # then apply the planned campaign & routine from the specified catch_year onward.
-  if (sc$id == "delay3y_catchup90_r90") {
-    delay_years <- start_year:(start_year + 2)
-    cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
-    cov_tbl$catchup_coverage[cov_tbl$year %in% delay_years] <- NA_real_
-  }
+  # Enforce zero vaccination during any delay window
+  cov_tbl <- apply_delay_zero_vax(cov_tbl, start_year = start_year, campaign_year = sc$catch_year)
 
-  # Clone model with this scenario's coverage
+  # Clone model with scenario-specific coverage
   mdl_sc <- clone_with_coverage(mdl, cov_tbl)
 
-  # Run the horizon with paradox diagnostics
+  # Run with paradox diagnostics
   run_sc <- run_horizon_with_paradox(
-    y_start     = y_start_locked,     # from your literature-locked burn-in
+    y_start     = y_start_locked,
     start_year  = start_year,
     n_years     = horizon_years,
-    pr          = parms_locked,       # literature-locked parameters
+    pr          = parms_locked,
     mdl         = mdl_sc,
     share_F     = share_F,
     share_M     = share_M,
@@ -484,44 +516,49 @@ for (i in seq_len(nrow(scenarios))) {
     tri_weights = tri_weights
   )
 
-  # Summaries for reporting
   df <- run_sc$results
-  out_row <- tibble::tibble(
-    id    = sc$id,
-    label = sc$label,
-    routine = sc$routine,
-    catch_year = sc$catch_year,
-    catch_cov  = sc$catch_cov,
-    CRS10      = sum(df$crs, na.rm = TRUE),
-    cum_inf_F1544 = sum(df$inf_F1544, na.rm = TRUE),
-    mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
-  )
 
-  scenario_results[[sc$id]] <- list(summary = out_row, timeseries = df, coverage = cov_tbl)
+  scenario_results[[sc$id]] <- list(
+    summary  = tibble::tibble(
+      id         = sc$id,
+      label      = sc$label,
+      routine    = sc$routine,
+      catch_year = sc$catch_year,
+      catch_cov  = sc$catch_cov,
+      campaign   = campaign_label(sc$catch_year, start_year),
+      CRS10      = sum(df$crs, na.rm = TRUE),
+      cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
+      mean_age_F1544_avg = mean(df$mean_age_F1544, na.rm = TRUE)
+    ),
+    timeseries = df,
+    coverage   = cov_tbl
+  )
 }
 
-# ---------------------------------------------
-# Collect summary table across scenarios (primary view for the report)
-scenario_summary <- dplyr::bind_rows(lapply(scenario_results, `[[`, "summary")) |>
+# Collect a summary table
+scenario_summary <- dplyr::bind_rows(lapply(scenario_results, `[[`, "summary")) %>%
   dplyr::arrange(CRS10)
-
 ```
 
-How much better is this than baseline: baseline = 
+How much better is this than baseline.
 
 ```{r}
-# ---------------------------------------------
-# Add CRS averted vs baseline (baseline = Routine 80% no catch-up)
-baseline_id <- "baseline80"
+# ---- CRS averted vs baseline (baseline = Routine 80% + no catch-up) ----
+# Select baseline row dynamically (in case labels/ids change)
+baseline_row <- scenario_summary %>%
+  dplyr::filter(is.na(catch_year), abs(routine - 0.80) < 1e-9) %>%
+  dplyr::slice(1)
 
-stopifnot(baseline_id %in% scenario_summary$id)
-CRS10_baseline <- scenario_summary$CRS10[scenario_summary$id == baseline_id]
+stopifnot(nrow(baseline_row) == 1)
+CRS10_baseline <- baseline_row$CRS10
 
-scenario_summary <- scenario_summary |>
+scenario_summary <- scenario_summary %>%
   dplyr::mutate(
     CRS10_averted = CRS10_baseline - CRS10
-  ) |>
+  ) %>%
   dplyr::arrange(dplyr::desc(CRS10_averted))
+
+scenario_summary
 ```
 
 # Sensitivity check
@@ -532,12 +569,13 @@ scenario_summary <- scenario_summary |>
 # - R0: keep literature-reasonable values
 # - Routine: 50%..95% in 5% steps
 # - Catch-up: 0%..95% in 10% steps (0 means no campaign)
-# - Campaign timing: immediate (start_year) vs delayed (+3y)
+# - Campaign timing: immediate (start_year) vs delayed (1, 2 and 3y)
 
-R0_vals_exp       <- c(6.0, 7.0, 8.0)
-routine_vals_exp  <- seq(0.50, 0.95, by = 0.05)
-catch_vals_exp    <- seq(0.00, 0.95, by = 0.10)  # 0 = no catch-up
-campaign_year_opts <- c(start_year, start_year + 1, start_year + 2)  # immediate vs 3-year delay
+# ---- sensitivity grid options (expanded) ----
+R0_vals_exp        <- c(6.0, 7.0, 8.0)
+routine_vals_exp   <- seq(0.50, 0.95, by = 0.05)
+catch_vals_exp     <- seq(0.00, 0.95, by = 0.10)  # 0 = no catch-up
+campaign_year_opts <- c(start_year, start_year + 1L, start_year + 2L, start_year + 3L)  # immediate, +1y, +2y, +3y
 ```
 
 
@@ -553,16 +591,13 @@ sens_rows_exp <- list()
 row_id <- 0L
 
 for (R0v in R0_vals_exp) {
-
-  # Copy literature-locked params, swap beta to match this R0 (beta = R0 * gamma)
   parms_sens <- parms_locked
   parms_sens$beta <- R0v * parms_locked$gamma
 
   for (pr in routine_vals_exp) {
     for (pc in catch_vals_exp) {
 
-      # If no catch-up (pc == 0), evaluate one "no-campaign" case only.
-      # Otherwise, evaluate both immediate and delayed campaigns.
+      # Decide which campaign years to evaluate for this catch-up %
       camp_years_this <- if (pc == 0) NA_integer_ else campaign_year_opts
 
       for (cy in camp_years_this) {
@@ -575,17 +610,13 @@ for (R0v in R0_vals_exp) {
           p_catchup     = if (is.na(cy)) NULL else pc
         )
 
-        # If the scenario is "delayed", ensure there is NO vaccination during the delay window
-        if (!is.na(cy) && cy > start_year) {
-          delay_years <- start_year:(cy - 1L)
-          cov_tbl$routine_coverage[cov_tbl$year %in% delay_years] <- 0
-          cov_tbl$catchup_coverage[cov_tbl$year %in% delay_years] <- NA_real_
-        }
+        # Apply zero-vax during delay window (generic)
+        cov_tbl <- apply_delay_zero_vax(cov_tbl, start_year = start_year, campaign_year = cy)
 
-        # Clone model with scenario-specific coverage
+        # Clone model with coverage
         mdl_sc <- clone_with_coverage(mdl, cov_tbl)
 
-        # Run 10-year horizon with paradox diagnostics
+        # Run horizon
         run_sc <- run_horizon_with_paradox(
           y_start     = y_start_locked,
           start_year  = start_year,
@@ -605,7 +636,7 @@ for (R0v in R0_vals_exp) {
           R0          = R0v,
           routine     = pr,
           catchup     = pc,
-          campaign    = if (pc == 0) "none" else if (cy == start_year) "immediate" else "delayed3y",
+          campaign    = if (pc == 0) "none" else campaign_label(cy, start_year),
           campaign_year = if (pc == 0) NA_integer_ else cy,
           CRS10       = sum(df$crs, na.rm = TRUE),
           cum_inf_F1544      = sum(df$inf_F1544, na.rm = TRUE),
@@ -617,42 +648,29 @@ for (R0v in R0_vals_exp) {
 }
 
 sens_expanded <- dplyr::bind_rows(sens_rows_exp)
+
+# Baseline per R0 for "CRS averted" comparisons (routine 80%, no catch-up, campaign='none')
+baseline_key <- sens_expanded %>%
+  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") %>%
+  dplyr::select(R0, baseline_CRS10 = CRS10)
+
+sens_expanded2 <- sens_expanded %>%
+  dplyr::left_join(baseline_key, by = "R0") %>%
+  dplyr::mutate(CRS10_averted = baseline_CRS10 - CRS10)
+
+# Ensure campaign facet order
+campaign_levels <- c("none", "immediate", "delayed1y", "delayed2y", "delayed3y")
+sens_expanded2 <- sens_expanded2 %>%
+  dplyr::mutate(campaign = factor(campaign, levels = campaign_levels))
 ```
 
 ```{r}
-# ---------------------------------------------
-# Define baseline for "CRS averted" comparisons:
-#   routine = 0.80, catchup = 0, (campaign='none') at each R0
-# This gives a baseline per R0 so differences are fair within that transmission setting.
-
-baseline_key <- sens_expanded |>
-  dplyr::filter(routine == 0.80, catchup == 0, campaign == "none") |>
-  dplyr::select(R0, baseline_CRS10 = CRS10)
-
-sens_expanded2 <- sens_expanded |>
-  dplyr::left_join(baseline_key, by = "R0") |>
-  dplyr::mutate(
-    CRS10_averted = baseline_CRS10 - CRS10
-  )
-
 # Quick view: best options per R0 (top 10 by CRS averted)
 best_per_R0 <- sens_expanded2 |>
   dplyr::group_by(R0) |>
   dplyr::arrange(dplyr::desc(CRS10_averted), .by_group = TRUE) |>
   dplyr::slice_head(n = 10L) |>
   dplyr::ungroup()
-
-#knitr::kable(
-#  best_per_R0,
-#  digits = c(2, 2, 2, NA, 0, 0, 0, 2),
-#  caption = "Top 10 scenarios per R0 by CRS averted (vs routine 80%, no catch-up)."
-#)
-
-# Save full grid and top table
-#out_dir <- "outputs"
-#if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-#readr::write_csv(sens_expanded2, file.path(out_dir, "sensitivity_grid_expanded.csv"))
-#readr::write_csv(best_per_R0,   file.path(out_dir, "sensitivity_grid_top10_by_R0.csv"))
 ```
 
 ## CRS Heatmap

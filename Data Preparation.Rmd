@@ -19,6 +19,7 @@ library(tidyr)
 library(readxl)
 library(stringr)
 rm(list=ls())
+source("R/config.R")
 ```
 
 # Population
@@ -40,7 +41,7 @@ glimpse(wpp_raw)
 
 # ---- Filter to South Africa & keep only the years we need ----
 
-years_keep <- 2025:2035  
+years_keep <- start_year:(start_year + horizon_years - 1)
 # Prefer human-readable "South Africa"; fallback to LocID==710 if needed.
 wpp_za <- wpp_raw %>%
   filter(
@@ -106,7 +107,7 @@ message("Saved: ", out_file)
 out_dir       <- "data/processed"
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-years_keep <- 2025:2035   # keep consistent window
+years_keep <- start_year:(start_year + horizon_years - 1)
 
 fert_path <- "data/raw/WPP2024_Fertility_by_Age1.csv.gz"
 
@@ -152,7 +153,7 @@ glimpse(fert_raw)
 
 ```{r}
 # ---- Parameters you can tweak ----
-years_keep   <- 2025:2035
+years_keep <- start_year:(start_year + horizon_years - 1)
 variant_keep <- "Constant fertility"  # <-- set to match your population variant
 # If you don't have "Constant fertility" in this file yet, use "Medium" for now:
 # variant_keep <- "Medium"
@@ -249,7 +250,7 @@ Create a coverage.csv dataframe to be used during the modeling. This will assume
 
 ```{r}
 # ---- Parameters that can be tweaked later ----
-policy_years  <- 2025:2035
+policy_years  <- start_year:(start_year + horizon_years - 1)
 campaign_year <- 2025         # the year the one-time catch-up happens
 routine_cov   <- 0.90         # e.g., 90% routine each year
 catchup_cov   <- 0.90         # e.g., 90% catch-up in the campaign year only
@@ -379,7 +380,7 @@ A proxy of the proportion of women who are pregnant each year at each age group.
 # - Variant should match the population pull (you used "Constant fertility")
 # - ASFR (age-specific fertility rate) units look like per 1000 women (values > 5)
 
-years_keep   <- 2025:2035
+years_keep <- start_year:(start_year + horizon_years - 1)
 variant_keep <- "Constant fertility"   # match your population/ births choice
 duration_years <- 40/52 # ~0.769; how long someone is pregnant in a year
 
@@ -431,10 +432,10 @@ summary(preg_prev$prev)
 # Mortality rate
 
 ```{r}
-# Re-read abridged life table (only needed columns)
+# ---- Mortality (expand abridged bands to single-year ages 0..100) ----
 lt_path  <- "data/raw/WPP2024_Life_Table_Abridged_Medium_2024-2100.csv.gz"
 proc_dir <- "data/processed"
-mort_years <- 2025:2035  # or just start_year if you prefer baseline-only
+mort_years <- start_year:(start_year + horizon_years - 1)
 
 lt_small <- readr::read_csv(
   lt_path,
@@ -442,49 +443,75 @@ lt_small <- readr::read_csv(
   show_col_types = FALSE
 )
 
+# Filter to South Africa + desired years, standardize fields
 lt_za <- lt_small %>%
   dplyr::filter(
     (Location == "South Africa") | (LocID == 710),
-    Time %in% mort_years,
-    Variant == "Medium"
+    Variant == "Medium",
+    Time %in% mort_years
   ) %>%
   dplyr::mutate(
+    year      = as.integer(Time),
     sex       = dplyr::case_when(Sex %in% c("Female","F") ~ "F",
                                  Sex %in% c("Male","M")   ~ "M",
                                  TRUE ~ NA_character_),
     age_start = as.integer(AgeGrpStart),
     span_raw  = as.integer(AgeGrpSpan)
   ) %>%
-  dplyr::select(Time, sex, age_start, span_raw, qx, mx)
+  dplyr::select(year, sex, age_start, span_raw, qx, mx)
 
-# Continuous hazard per band; set span for open-ended band to reach age 100
+# Continuous hazard per band; set span for open-ended band to end at 100
 lt_haz <- lt_za %>%
   dplyr::mutate(
-    # span: if open-ended (NA), extend to age 100 inclusive
+    # If the band is open-ended (NA), extend to age 100 inclusive
     span = dplyr::if_else(is.na(span_raw), 101L - pmin(age_start, 100L), span_raw),
     age_start = pmin(age_start, 100L),
     qx  = dplyr::if_else(is.na(qx), NA_real_, pmin(pmax(qx, 0), 0.999999)),
     mu_band = dplyr::case_when(
-      !is.na(qx)              ~ -log(1 - qx) / pmax(span, 1L),
-      is.na(qx) & !is.na(mx)  ~ as.numeric(mx),   # fallback to central death rate
+      !is.na(qx)              ~ -log(1 - qx) / pmax(span, 1L),  # convert prob to hazard
+      is.na(qx) & !is.na(mx)  ~ as.numeric(mx),                 # fallback to central death rate
       TRUE                    ~ NA_real_
     )
   ) %>%
   dplyr::filter(!is.na(sex), !is.na(mu_band), !is.na(span), span > 0)
 
-# Keep one row per age (0..99) within each year–sex slice
+# Expand each (year, sex, age_start, span) to single-year ages; cap to 0..100
+lt_expanded <- lt_haz %>%
+  dplyr::transmute(
+    year, sex,
+    age_start = as.integer(age_start),
+    span      = as.integer(span),
+    mu        = as.numeric(mu_band)
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(age_vec = list(seq.int(from = age_start,
+                                       to   = min(age_start + span - 1L, 100L)))) %>%
+  dplyr::ungroup() %>%
+  tidyr::unnest_longer(age_vec, values_to = "age") %>%
+  dplyr::select(year, sex, age, mu) %>%
+  dplyr::arrange(year, sex, age)
+
+# Keep one row per age 0..99 within each (year, sex)
 lt_0_99 <- lt_expanded %>%
+  dplyr::filter(age >= 0L, age <= 99L) %>%
   dplyr::group_by(year, sex) %>%
   dplyr::arrange(age, .by_group = TRUE) %>%
-  dplyr::distinct(age, .keep_all = TRUE) %>%  # replaces slice_unique()
+  dplyr::distinct(age, .keep_all = TRUE) %>%
   dplyr::ungroup()
 
-# Create an age-100 row by copying the last hazard in each (year, sex)
-lt_age100 <- lt_0_99 %>%
-  dplyr::group_by(year, sex) %>%
-  dplyr::summarise(mu = dplyr::last(mu), .groups = "drop") %>%
-  dplyr::mutate(age = 100L) %>%
+# Create age-100 by copying the last hazard in each (year, sex)
+lt_age100 <- lt_expanded %>%
+  dplyr::filter(age == 100L) %>%
   dplyr::select(year, sex, age, mu)
+
+# If the source did not include an explicit 100 row, derive it from the last available age
+if (nrow(lt_age100) == 0) {
+  lt_age100 <- lt_0_99 %>%
+    dplyr::group_by(year, sex) %>%
+    dplyr::summarise(mu = dplyr::last(mu), .groups = "drop") %>%
+    dplyr::mutate(age = 100L) %>%
+    dplyr::select(year, sex, age, mu)
+}
 
 # Bind and sort
 lt_singleyear <- dplyr::bind_rows(lt_0_99, lt_age100) %>%

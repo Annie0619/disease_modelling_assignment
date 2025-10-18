@@ -1,12 +1,13 @@
 # ---- config.R -------------------------------------------------------------
 # Central knobs used by analysis scripts.
 
+# ---- config.R (policy horizon) ----
 set.seed(42)
 verbose <- TRUE
 
-# Simulation window (policy horizon; fitting window comes later)
 start_year    <- 2025
-horizon_years <- 10
+horizon_years <- 25  # <-- set 10 for short-term; 20–25 to see routine's cohort effect
+
 sim_years     <- start_year:(start_year + horizon_years - 1)
 
 # Demographic structure
