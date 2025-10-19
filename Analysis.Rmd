@@ -353,6 +353,93 @@ ggsave("plots/validation_obs_vs_exp.png", p_val, width = 7, height = 4, dpi = 40
 message("Saved: plots/validation_obs_vs_exp.png")
 ```
 
+# # Model fitting to data (negative binomial likelihood)
+
+```{r}
+# ---- Model fitting to data (negative binomial likelihood) ----
+# 3B.1: source the NB fitter and define a simulator wrapper for the fit window
+source("R/fit_nb.R")
+
+simulate_fit_years <- function(par, y0, mdl, years) {
+  # Stationary demography (mortality from fit_ref_demog) and no vaccination,
+  # exactly like the validation section — just parameterized by `par`.
+  pr_here <- list(
+    sigma = par$sigma, gamma = par$gamma, beta = par$beta, rho = par$rho,
+    VE    = par$VE,   eps   = 1e-8
+  )
+  sim <- run_stationary_novax(
+    y_start = y0,
+    years   = years,
+    pr      = pr_here,
+    mdl     = mdl,
+    ref_year = fit_ref_demog,   # same as your validation
+    share_F = share_F,
+    share_M = share_M
+  )
+  sim$results %>% dplyr::select(year, infections_total)
+}
+```
+
+
+```{r}
+# 3B.2: Multi-start grid (beta via R0 * gamma), rho, k
+R0_starts  <- c(6.0, 7.5, 9.0)
+rho_starts <- c(5e-4, 2e-3, 1e-2)   # include a smaller rho
+k_starts   <- c(3, 20, 200)         # allow both more and less dispersion
+
+set.seed(42)
+jitter <- function(x, frac = 0.15) x * exp(rnorm(length(x), sd = frac))
+par_init_grid <- expand.grid(
+  beta = jitter(R0_starts * gamma_fix, 0.10),
+  rho  = jitter(rho_starts, 0.25),
+  k    = jitter(k_starts,   0.25),
+  KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+) %>% dplyr::as_tibble()
+
+# Conservative box bounds for L-BFGS-B
+bounds <- list(
+  lower = c(beta = 1e-3, rho = 1e-7, k = 1e-3),
+  upper = c(beta = 1e4,  rho = 0.4,  k = 1e6)
+)
+```
+
+```{r}
+# 3B.3: Execute the fit (parallel multi-start)
+nb_fit <- fit_nb_to_cases(
+  mdl               = mdl,
+  y0_burn           = y_burn_fit,      # burned-in state ready at the first fit year
+  fit_years         = fit_years,       # e.g., 2012:2019
+  simulate_fit_years = simulate_fit_years,
+  y_obs_df          = cases_fit,       # the data
+  par_init_grid     = par_init_grid,
+  bounds            = bounds,
+  workers           = max(1L, parallel::detectCores() - 1L),
+  sigma             = 1 / latent_period_years,
+  gamma             = 1 / infectious_period_years,
+  VE                = VE
+)
+
+# Peek at results
+nb_fit$best
+head(nb_fit$estimates)
+head(nb_fit$fit_series)
+```
+
+```{r}
+# GoF summary
+rmse <- sqrt(mean((nb_fit$fit_series$obs - nb_fit$fit_series$mu_hat)^2, na.rm = TRUE))
+cat(sprintf("NB fit RMSE (annual counts) = %.2f\n", rmse))
+
+# Quick plot (Observed vs fitted mean)
+p_fit <- ggplot(nb_fit$fit_series, aes(x = year)) +
+  geom_point(aes(y = obs), size = 2) +
+  geom_line(aes(y = mu_hat)) +
+  labs(title = "Observed vs fitted (NB mean)",
+       y = "Reported cases", x = "Year") +
+  theme_bw(base_size = 14)
+ggsave("plots/fit_nb_obs_vs_mu.png", p_fit, width = 7, height = 4, dpi = 400)
+```
+
 
 # Add diagnostics for mean age of infection
 
